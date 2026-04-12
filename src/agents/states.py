@@ -1,20 +1,21 @@
 from typing import Optional
 from typing_extensions import Annotated, TypedDict
 from provider import Asset
-from pydantic import HttpUrl
+from models import ValuationModel
 import operator
 from datetime import date
 
 class WorkflowState(TypedDict):
     date: str
+    run_datetime: str          # datetime.now().isoformat() at run start — used for artifact filename
     company: str
     ticker: str
     price_data: Optional[Asset]
     bull_thesis: str
     bear_thesis: str
-    bull_sources: list[HttpUrl]
-    bear_sources: list[HttpUrl]
+    sources: list[str]
     judge_decision: str
+    valuation: Optional[ValuationModel]
     final_report: str
 
 class ResearchState(TypedDict):
@@ -27,5 +28,8 @@ class ResearchState(TypedDict):
     research_topics: list[str]
     key_points: list[str]
     thesis: str
-    sources: list[HttpUrl]
+    sources: list[str]
     messages: Annotated[list[str], operator.add]
+
+class Context:
+    user_id: str

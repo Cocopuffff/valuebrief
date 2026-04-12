@@ -70,4 +70,6 @@ dependencies = [
     "zope-interface>=8.2",
     "zstandard>=0.25.0",
     "markdownify>=1.2.2",
+    "psycopg[async,binary,pool]>=3.3.3",
+    "langgraph-checkpoint-postgres>=3.0.5",
 ]

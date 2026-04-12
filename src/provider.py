@@ -7,12 +7,15 @@ from langchain.tools import tool
 from ddgs import DDGS
 import httpx
 from markdownify import markdownify
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 class FinancialDataProvider:
     @staticmethod
     def _get_asset_data(ticker: str) -> Optional[Asset]:
         """Fetch data from yfinance using the stock ticker and return an Asset instance."""
-        print(f'Fetching data for {ticker}...')
+        logger.info(f'Fetching data for {ticker}...')
         stock = yf.Ticker(ticker)
         info = stock.info
 
@@ -20,19 +23,25 @@ class FinancialDataProvider:
         current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
         
         if current_price is None:
-            print(f"Skipping {ticker} because no price data was found.")
+            logger.warning(f"Skipping {ticker} because no price data was found.")
             return None
         
         # Financial metrics
         fundamentals = FinancialMetrics(
             pe_ratio=info.get('trailingPE'),
+            forward_pe_ratio=info.get('forwardPE'),
             peg_ratio=info.get('pegRatio'),
             price_to_book=info.get('priceToBook'),
             debt_to_equity=info.get('debtToEquity'),
             dividend_yield=info.get('dividendYield'),
             free_cash_flow=info.get('freeCashflow'),
             revenue_growth=info.get('revenueGrowth'),
-            ebitda_margin=info.get('ebitdaMargins')
+            ebitda_margin=info.get('ebitdaMargins'),
+            earnings_per_share=info.get('trailingEps'),
+            market_cap=info.get('marketCap'),
+            return_on_equity=info.get('returnOnEquity'),
+            current_ratio=info.get('currentRatio'),
+            total_revenue=info.get('totalRevenue'),
         )
 
         asset = Asset(
@@ -41,10 +50,11 @@ class FinancialDataProvider:
             sector=info.get('sector'),
             industry=info.get('industry'),
             current_price=current_price,
+            shares_outstanding=info.get('sharesOutstanding'),
             fundamentals=fundamentals,
             last_updated=datetime.now()
         )
-        print(f'Financial data retrieved for {ticker}:\n{asset}')
+        logger.debug(f'Financial data retrieved for {ticker}: {asset}')
         return asset
 
     @tool
@@ -58,7 +68,7 @@ class FinancialDataProvider:
     def get_multiple_assets(tickers: List[str]) -> List[Asset]:
         """Fetch multiple assets from yfinance using the stock tickers and return a list of Asset instances."""
         assets = []
-        print(f'Fetching data for {tickers}...')
+        logger.info(f'Fetching data for {tickers}...')
         for ticker in tickers:
             asset = FinancialDataProvider._get_asset_data(ticker)
             if asset is not None:
@@ -77,36 +87,40 @@ class FinancialDataProvider:
     @staticmethod
     def get_latest_news(query: str) -> list[dict[str, Any]]:
         """Gets latest news within the last 24 hours. Returns up to 10 headlines with titles, URLs, and short snippets. To read the full article content, use scrape_website with the article URL."""
-        print(f'Fetching news within last 24 hours for query "{query}"...')
-        news : list[dict[str, Any]] = DDGS().news(
-            query,
-            region='us-en',
-            max_results=10,
-            timelimit="1d"
-        )
-        print(f'{len(news)} news retrieved')
-        for article in news:
-            print(f"Title: {article.get('title')}")
-            print(f"Link: {article.get('url', article.get('href'))}")
-        
-        return news
+        logger.info(f'Fetching news within last 24 hours for query "{query}"...')
+        try:
+            news = list(DDGS().news(
+                query,
+                region='us-en',
+                max_results=10,
+                timelimit="d"
+            ))
+            logger.info(f'{len(news)} news retrieved')
+            for article in news:
+                logger.debug(f"Title: {article.get('title')}, Link: {article.get('url', article.get('href'))}")
+            return news
+        except Exception as e:
+            logger.error(f"Error fetching news for {query}: {e}")
+            return []
     
     @tool
     @staticmethod
     def search(query: str) -> list[dict[str, Any]]:
         """Search the internet for information. Returns up to 10 results with titles, URLs, and short snippets. To read the full page content, use scrape_website with the page URL."""
-        print(f'Searching "{query}"...')
-        searches = DDGS().text(
-            query,
-            region='us-en',
-            max_results=10
-        )
-        print(f'{len(searches)} searches retrieved')
-        for article in searches:
-            print(f"Title: {article.get('title')}")
-            print(f"Link: {article.get('href')}")
-        
-        return searches
+        logger.info(f'Searching "{query}"...')
+        try:
+            searches = list(DDGS().text(
+                query,
+                region='us-en',
+                max_results=10
+            ))
+            logger.info(f'{len(searches)} searches retrieved')
+            for article in searches:
+                logger.debug(f"Title: {article.get('title')}, Link: {article.get('href')}")
+            return searches
+        except Exception as e:
+            logger.error(f"Error searching for {query}: {e}")
+            return []
 
     @staticmethod
     def _scrape_url(url: str, max_chars: int = 5000) -> str:
@@ -122,6 +136,7 @@ class FinancialDataProvider:
                 text = text[:max_chars] + "... [truncated]"
             return text
         except Exception as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
             return f"Error fetching {url}: {str(e)}"
 
     @tool

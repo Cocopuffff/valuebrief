@@ -1,13 +1,17 @@
 import json
-from langchain.chat_models import init_chat_model
 from langchain_openrouter import ChatOpenRouter
 from langchain.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
 from typing import Any, Literal
-from .states import ResearchState, WorkflowState
-from provider import FinancialDataProvider, DateTimeProvider
+
+from models import AgentNode
+from .states import ResearchState
+from provider import FinancialDataProvider
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 model = ChatOpenRouter(
-    model="anthropic/claude-opus-4.6",
+    model="qwen/qwen3.6-plus",
     temperature=0.2
 )
 
@@ -110,7 +114,7 @@ def _prepare_messages_for_thesis(
         total_chars += msg_chars
 
     result.reverse()
-    print(f"[Context] Thesis preparation: {len(result)}/{len(collapsed)} messages, ~{total_chars:,} chars")
+    logger.info(f"Context preparation: {len(result)}/{len(collapsed)} messages, ~{total_chars:,} chars")
     return result
 
 
@@ -140,16 +144,12 @@ def _extract_text(content) -> str:
 # ── Logging helpers ──────────────────────────────────────────────────────
 
 def _log_response(label: str, response: AIMessage) -> None:
-    """Print the model's thoughts and planned tool calls."""
+    """Log the model's thoughts and planned tool calls."""
     if response.content:
-        print(f"\n{'─'*60}")
-        print(f"[{label}] 💭 Thinking:")
-        print(response.content)
-        print(f"{'─'*60}")
+        logger.info(f"[{label}] 💭 Thinking:\n{response.content}")
     if response.tool_calls:
         tools_planned = [f"  → {tc['name']}({', '.join(f'{k}={v!r}' for k, v in tc['args'].items())})" for tc in response.tool_calls]
-        print(f"[{label}] 🔧 Tool calls planned:")
-        print('\n'.join(tools_planned))
+        logger.info(f"[{label}] 🔧 Tool calls planned:\n" + '\n'.join(tools_planned))
 
 
 # ── Analyst nodes ─────────────────────────────────────────────────────────
@@ -183,10 +183,9 @@ def bull_analyst(state: ResearchState) -> dict:
     """Bull analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
     remaining = state['max_iterations'] - iteration
-    print(f"[Bull Analyst] Entering iteration {iteration} (remaining: {remaining})")
+    logger.info(f"[Bull Analyst] Iteration {iteration} ({remaining} remaining)")
 
     if iteration < state['max_iterations']:
-        print(f"[Bull Analyst] Researching...")
         system = BULL_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
             date=state['date'], remaining=remaining
@@ -199,13 +198,24 @@ def bull_analyst(state: ResearchState) -> dict:
         _log_response("Bull Analyst", response)
         result = {"messages": [response], "iteration_count": 1}
         # If the model chose to write analysis instead of calling tools,
-        # capture it as the thesis now — should_continue will route to END
+        # capture it as the thesis now — analyst_router will route to END
         if not response.tool_calls and response.content:
             result["thesis"] = _extract_text(response.content)
+        elif response.tool_calls:
+            for tool_call in response.tool_calls:
+                if tool_call["name"] == "scrape_website":
+                    url_value = tool_call["args"]
+                    url_str = None
+                    if isinstance(url_value, str):
+                        url_str = url_value
+                    elif isinstance(url_value, dict) and "url" in url_value:
+                        url_str = url_value["url"]
+                    if url_str:
+                        state["sources"].append(url_str)
         return result
     else:
         # Final iteration — produce thesis from all collected research
-        print(f"[Bull Analyst] Completing research — writing thesis")
+        logger.info(f"[Bull Analyst] Writing final thesis")
         thesis_messages = _prepare_messages_for_thesis(state['messages'])
         final_prompt = f"""You are a bullish equity analyst. You have completed all your research on {state['company']} ({state['ticker']}). Today is {state['date']}.
 
@@ -217,6 +227,11 @@ Your thesis MUST cover:
 - Competitive moat assessment
 - Growth catalysts
 - Risk/reward asymmetry
+
+Your thesis MUST adhere strictly to standard Markdown formatting rules:
+- All headings MUST be surrounded by blank lines.
+- All lists MUST be surrounded by blank lines.
+- Always use exactly one space after a list marker (e.g., '- item', not '-  item').
 
 Write a structured, substantive investment thesis. Do NOT attempt to call any tools."""
         response: AIMessage = model.invoke(
@@ -234,10 +249,9 @@ def bear_analyst(state: ResearchState) -> dict:
     """Bear analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
     remaining = state['max_iterations'] - iteration
-    print(f"[Bear Analyst] Entering iteration {iteration} (remaining: {remaining})")
+    logger.info(f"[Bear Analyst] Iteration {iteration} ({remaining} remaining)")
 
     if iteration < state['max_iterations']:
-        print(f"[Bear Analyst] Researching...")
         system = BEAR_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
             date=state['date'], remaining=remaining
@@ -250,9 +264,20 @@ def bear_analyst(state: ResearchState) -> dict:
         result = {"messages": [response], "iteration_count": 1}
         if not response.tool_calls and response.content:
             result["thesis"] = _extract_text(response.content)
+        elif response.tool_calls:
+            for tool_call in response.tool_calls:
+                if tool_call["name"] == "scrape_website":
+                    url_value = tool_call["args"]
+                    url_str = None
+                    if isinstance(url_value, str):
+                        url_str = url_value
+                    elif isinstance(url_value, dict) and "url" in url_value:
+                        url_str = url_value["url"]
+                    if url_str:
+                        state["sources"].append(url_str)
         return result
     else:
-        print(f"[Bear Analyst] Completing research — writing thesis")
+        logger.info(f"[Bear Analyst] Writing final thesis")
         thesis_messages = _prepare_messages_for_thesis(state['messages'])
         final_prompt = f"""You are a bearish equity analyst. You have completed all your research on {state['company']} ({state['ticker']}). Today is {state['date']}.
 
@@ -264,6 +289,11 @@ Your thesis MUST cover:
 - Competitive threats
 - Earnings quality issues
 - Downside catalysts
+
+Your thesis MUST adhere strictly to standard Markdown formatting rules:
+- All headings MUST be surrounded by blank lines.
+- All lists MUST be surrounded by blank lines.
+- Always use exactly one space after a list marker (e.g., '- item', not '-  item').
 
 Write a structured, substantive investment thesis. Do NOT attempt to call any tools."""
         response = model.invoke(
@@ -288,8 +318,6 @@ def research_tool_node(state: ResearchState) -> dict[str, Any]:
         for tool_call in last_message.tool_calls:
             tool = research_tools_by_name[tool_call["name"]]
             observation = tool.invoke(tool_call["args"])
-            # Ensure content is always a string — list/dict outputs cause
-            # LangChain deserialization errors ("Could not find discriminator field type")
             if not isinstance(observation, str):
                 observation = json.dumps(observation, default=str)
             result.append(ToolMessage(content=observation, 
@@ -297,14 +325,14 @@ def research_tool_node(state: ResearchState) -> dict[str, Any]:
     return {"messages": result}
 
 
-def should_continue(state: ResearchState) -> Literal["research_tool_node", "supervisor"]:
+def should_continue(state: ResearchState) -> Literal[AgentNode.RESEARCH_TOOL_NODE, AgentNode.SUPERVISOR]:
     """Route: if the model made tool calls, execute them; otherwise return to supervisor."""
     messages = state["messages"]
     last_message = messages[-1]
 
     if isinstance(last_message, AIMessage):
         if last_message.tool_calls:
-            return "research_tool_node"
+            return AgentNode.RESEARCH_TOOL_NODE
 
-    return "supervisor"
+    return AgentNode.SUPERVISOR
     
