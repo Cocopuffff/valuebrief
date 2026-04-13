@@ -1,3 +1,4 @@
+import os
 import yfinance as yf
 import pandas as pd
 from typing import List, Optional, Any
@@ -14,13 +15,56 @@ logger = get_logger(__name__)
 class FinancialDataProvider:
     @staticmethod
     def _get_asset_data(ticker: str) -> Optional[Asset]:
-        """Fetch data from yfinance using the stock ticker and return an Asset instance."""
+        """Fetch data from AlphaVantage and yfinance and return an Asset instance."""
         logger.info(f'Fetching data for {ticker}...')
+
+        av_api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+        av_overview = {}
+        av_quote = {}
+
+        if av_api_key:
+            try:
+                # Fetch Overview
+                url_overview = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={av_api_key}"
+                resp_overview = httpx.get(url_overview, timeout=10)
+                resp_overview.raise_for_status()
+                data_overview = resp_overview.json()
+                if "Symbol" in data_overview:
+                    av_overview = data_overview
+                else:
+                    logger.warning(f"AlphaVantage OVERVIEW error for {ticker}: {data_overview}")
+
+                # Fetch Global Quote
+                url_quote = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={av_api_key}"
+                resp_quote = httpx.get(url_quote, timeout=10)
+                resp_quote.raise_for_status()
+                data_quote = resp_quote.json()
+                if "Global Quote" in data_quote and "05. price" in data_quote["Global Quote"]:
+                    av_quote = data_quote["Global Quote"]
+                else:
+                    logger.warning(f"AlphaVantage GLOBAL_QUOTE error for {ticker}: {data_quote}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch AlphaVantage data for {ticker}: {e}")
+
         stock = yf.Ticker(ticker)
         info = stock.info
 
+        def _get_float_metric(av_key: str, yf_key: str, av_dict: Optional[dict] = None) -> Optional[float]:
+            if av_dict is None:
+                av_dict = av_overview
+            if av_dict and av_key in av_dict:
+                val = av_dict[av_key]
+                if val not in ("None", "-", ""):
+                    try:
+                        return float(val)
+                    except ValueError:
+                        pass
+            return info.get(yf_key)
+
         # Extracting current price
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        current_price = _get_float_metric("05. price", "currentPrice", av_quote)
+        if current_price is None:
+            current_price = info.get('regularMarketPrice') or info.get('previousClose')
         
         if current_price is None:
             logger.warning(f"Skipping {ticker} because no price data was found.")
@@ -28,29 +72,45 @@ class FinancialDataProvider:
         
         # Financial metrics
         fundamentals = FinancialMetrics(
-            pe_ratio=info.get('trailingPE'),
-            forward_pe_ratio=info.get('forwardPE'),
-            peg_ratio=info.get('pegRatio'),
-            price_to_book=info.get('priceToBook'),
+            pe_ratio=_get_float_metric("TrailingPE", "trailingPE"),
+            forward_pe_ratio=_get_float_metric("ForwardPE", "forwardPE"),
+            peg_ratio=_get_float_metric("PEGRatio", "pegRatio"),
+            price_to_book=_get_float_metric("PriceToBookRatio", "priceToBook"),
             debt_to_equity=info.get('debtToEquity'),
-            dividend_yield=info.get('dividendYield'),
+            dividend_yield=_get_float_metric("DividendYield", "dividendYield"),
             free_cash_flow=info.get('freeCashflow'),
-            revenue_growth=info.get('revenueGrowth'),
-            ebitda_margin=info.get('ebitdaMargins'),
-            earnings_per_share=info.get('trailingEps'),
-            market_cap=info.get('marketCap'),
-            return_on_equity=info.get('returnOnEquity'),
+            revenue_growth=_get_float_metric("QuarterlyRevenueGrowthYOY", "revenueGrowth"),
+            ebitda_margin=_get_float_metric("ProfitMargin", "ebitdaMargins"),
+            earnings_per_share=_get_float_metric("EPS", "trailingEps"),
+            market_cap=_get_float_metric("MarketCapitalization", "marketCap"),
+            return_on_equity=_get_float_metric("ReturnOnEquityTTM", "returnOnEquity"),
             current_ratio=info.get('currentRatio'),
-            total_revenue=info.get('totalRevenue'),
+            total_revenue=_get_float_metric("RevenueTTM", "totalRevenue"),
+            profit_margin=_get_float_metric("ProfitMargin", "profitMargins"),
+            operating_margin=_get_float_metric("OperatingMarginTTM", "operatingMargins"),
+            return_on_assets=_get_float_metric("ReturnOnAssetsTTM", "returnOnAssets"),
+            price_to_sales=_get_float_metric("PriceToSalesRatioTTM", "priceToSalesTrailing12Months"),
+            ev_to_revenue=_get_float_metric("EVToRevenue", "enterpriseToRevenue"),
+            ev_to_ebitda=_get_float_metric("EVToEBITDA", "enterpriseToEbitda"),
+            beta=_get_float_metric("Beta", "beta"),
+            target_price=_get_float_metric("AnalystTargetPrice", "targetMeanPrice"),
+            fifty_two_week_high=_get_float_metric("52WeekHigh", "fiftyTwoWeekHigh"),
+            fifty_two_week_low=_get_float_metric("52WeekLow", "fiftyTwoWeekLow"),
+            fifty_day_moving_average=_get_float_metric("50DayMovingAverage", "fiftyDayAverage"),
+            two_hundred_day_moving_average=_get_float_metric("200DayMovingAverage", "twoHundredDayAverage"),
         )
+
+        name = av_overview.get("Name") if av_overview.get("Name") not in (None, "None", "-") else info.get('longName')
+        sector = av_overview.get("Sector") if av_overview.get("Sector") not in (None, "None", "-") else info.get('sector')
+        industry = av_overview.get("Industry") if av_overview.get("Industry") not in (None, "None", "-") else info.get('industry')
 
         asset = Asset(
             ticker=ticker,
-            name=info.get('longName'),
-            sector=info.get('sector'),
-            industry=info.get('industry'),
-            current_price=current_price,
-            shares_outstanding=info.get('sharesOutstanding'),
+            name=name,
+            sector=sector,
+            industry=industry,
+            current_price=float(current_price),
+            shares_outstanding=_get_float_metric("SharesOutstanding", "sharesOutstanding"),
             fundamentals=fundamentals,
             last_updated=datetime.now()
         )

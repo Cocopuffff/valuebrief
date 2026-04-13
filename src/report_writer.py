@@ -151,12 +151,12 @@ class RunReportWriter:
             f"---\n"
         )
 
-    def write_final_report(self, report_text: str, sources: list) -> None:
+    def write_final_report(self, debug_report_text: str, report_text: str, sources: list) -> None:
         """Append the Final Report section including sources."""
         debug_content = (
             f"\n## 📄 Final Report\n\n"
             f"> Completed: {datetime.now().isoformat()}\n\n"
-            f"{report_text}\n"
+            f"{debug_report_text}\n"
         )
         final_content = (
             f"> Completed: {datetime.now().isoformat()}\n\n"

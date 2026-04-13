@@ -12,6 +12,7 @@ from agents.judge import judge_analyst, _build_dcf_summary
 from models import AgentNode
 from logger import get_logger
 from report_writer import RunReportWriter
+import json
 
 logger = get_logger(__name__)
 
@@ -141,10 +142,8 @@ DCF VALUATION
     unique_sources = sorted(list(set(state.get("sources", []))))
     sources_formatted = "\n".join(f"- {s}" for s in unique_sources) if unique_sources else "N/A"
 
-    report = f"""
-{'═'*50}
-INVESTMENT REPORT: {state['company']} ({state['ticker']})
-{'═'*50}
+    debug_report = f"""
+DEBUG REPORT: {state['company']} ({state['ticker']})
 
 BULL THESIS:
 {state.get('bull_thesis', 'N/A')}
@@ -158,14 +157,25 @@ JUDGE DECISION:
 
 SOURCES:
 {sources_formatted}
-{'═'*50}
+
+WORKFLOW_STATE:
+{json.dumps(state, indent=2)}
+"""
+
+    report = f"""
+INVESTMENT THESIS:
+{state.get('judge_decision', 'N/A')}
+{valuation_section}
+
+SOURCES:
+{sources_formatted}
 """
     # Persist final report to run artifact
     run_dt = state.get("run_datetime", "")
     if run_dt:
         try:
             writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
-            writer.write_final_report(report, unique_sources)
+            writer.write_final_report(debug_report, report, unique_sources)
             logger.info(f"[Report Generator] 📝 Written final report to {writer.final_path}")
         except Exception as e:
             logger.warning(f"[Report Generator] ⚠️ Failed to write final report: {e}")

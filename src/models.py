@@ -8,7 +8,7 @@ import warnings
 # ── Active Models ─────────────────────────────────────────────────────────
 
 class FinancialMetrics(BaseModel):
-    """Fundamental metrics of a company, populated from yfinance."""
+    """Fundamental metrics of a company, populated from AlphaVantage and yfinance."""
     pe_ratio: Optional[float] = Field(default=None, description="Trailing Price to Earnings Ratio")
     forward_pe_ratio: Optional[float] = Field(default=None, description="Forward Price to Earnings Ratio")
     peg_ratio: Optional[float] = Field(default=None, description="Price/Earnings to Growth Ratio")
@@ -23,6 +23,18 @@ class FinancialMetrics(BaseModel):
     return_on_equity: Optional[float] = Field(default=None, description="Return on Equity")
     current_ratio: Optional[float] = Field(default=None, description="Current Ratio (current assets / current liabilities)")
     total_revenue: Optional[float] = Field(default=None, description="Total Revenue (TTM)")
+    profit_margin: Optional[float] = Field(default=None, description="Profit Margin")
+    operating_margin: Optional[float] = Field(default=None, description="Operating Margin (TTM)")
+    return_on_assets: Optional[float] = Field(default=None, description="Return on Assets (TTM)")
+    price_to_sales: Optional[float] = Field(default=None, description="Price to Sales Ratio (TTM)")
+    ev_to_revenue: Optional[float] = Field(default=None, description="Enterprise Value to Revenue")
+    ev_to_ebitda: Optional[float] = Field(default=None, description="Enterprise Value to EBITDA")
+    beta: Optional[float] = Field(default=None, description="Beta")
+    target_price: Optional[float] = Field(default=None, description="Analyst Target Price")
+    fifty_two_week_high: Optional[float] = Field(default=None, description="52 Week High")
+    fifty_two_week_low: Optional[float] = Field(default=None, description="52 Week Low")
+    fifty_day_moving_average: Optional[float] = Field(default=None, description="50 Day Moving Average")
+    two_hundred_day_moving_average: Optional[float] = Field(default=None, description="200 Day Moving Average")
 
 
 class Asset(BaseModel):
