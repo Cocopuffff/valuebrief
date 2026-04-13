@@ -182,17 +182,56 @@ class ValuationModel(BaseModel):
     @property
     def expected_cagr(self) -> Optional[float]:
         """
-        Annualized return if market price converges to expected intrinsic value
-        over the holding period.
+        Implied annual return (IRR) from the probability-weighted DCF cash flows
+        at the current market price.
 
-        CAGR = (Expected Value / Current Price) ^ (1 / years) - 1
+        Solves for r in:
+            Market Cap = Σ(weighted_NOPAT_t / (1+r)^t) + weighted_TV / (1+r)^10
+
+        This is the rate of return an investor earns if the projected cash flows
+        materialise and the stock is purchased at today's market price —
+        equivalent to the Stock Unlock DCF visualiser approach.
         """
-        if self.current_price <= 0 or self.expected_value <= 0:
+        if self.current_price <= 0 or not self.scenarios:
             return None
-        return round(
-            (self.expected_value / self.current_price) ** (1 / self.holding_period_years) - 1,
-            4
-        )
+
+        market_cap = self.current_price * self.shares_outstanding
+
+        # Build probability-weighted cash flows for years 1–10 and terminal value
+        weighted_nopats: Dict[int, float] = {}  # year_index (1-10) → weighted NOPAT
+        weighted_tv = 0.0
+
+        for s in self.scenarios.values():
+            if not s.dcf_table or not s.terminal_value_details:
+                return None  # DCF hasn't been computed yet
+            p = s.probability
+            for i, row in enumerate(s.dcf_table):
+                year_idx = i + 1
+                weighted_nopats[year_idx] = weighted_nopats.get(year_idx, 0) + p * row["nopat"]
+            weighted_tv += p * s.terminal_value_details.terminal_value
+
+        # Bisection method to solve for IRR
+        def npv(r: float) -> float:
+            total = 0.0
+            for t, nopat in weighted_nopats.items():
+                total += nopat / (1 + r) ** t
+            total += weighted_tv / (1 + r) ** 10
+            return total - market_cap
+
+        lo, hi = -0.50, 2.0  # search between -50% and +200%
+        if npv(lo) * npv(hi) > 0:
+            return None  # no root in range
+
+        for _ in range(100):  # bisection converges quickly
+            mid = (lo + hi) / 2
+            if npv(mid) > 0:
+                lo = mid
+            else:
+                hi = mid
+            if abs(hi - lo) < 1e-4:
+                break
+
+        return round((lo + hi) / 2, 4)
 
     @computed_field
     @property
