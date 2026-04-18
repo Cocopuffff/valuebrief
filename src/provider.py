@@ -49,17 +49,47 @@ class FinancialDataProvider:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        def _get_float_metric(av_key: str, yf_key: str, av_dict: Optional[dict] = None) -> Optional[float]:
+        def _get_float_metric(
+            av_key: str,
+            yf_key: str,
+            av_dict: Optional[dict] = None,
+        ) -> Optional[float]:
+            """Fetch a numeric metric from AlphaVantage (primary) with yfinance fallback.
+
+            Args:
+                av_key: AlphaVantage response key.
+                yf_key: yfinance info dict key.
+                av_dict: Override AV source dict (e.g. av_quote for price).
+            """
+            av_val = None
             if av_dict is None:
                 av_dict = av_overview
             if av_dict and av_key in av_dict:
                 val = av_dict[av_key]
                 if val not in ("None", "-", ""):
                     try:
-                        return float(val)
+                        av_val = float(val)
                     except ValueError:
                         pass
-            return info.get(yf_key)
+            
+            yf_val_raw = info.get(yf_key)
+            try:
+                yf_val = float(yf_val_raw) if yf_val_raw is not None else None
+            except ValueError:
+                yf_val = None
+
+            if av_val is not None:
+                if av_val == 0.0:
+                    if yf_val is not None and yf_val != 0.0:
+                        logger.debug(f"AV {av_key} is 0.0; falling back to yfinance {yf_key}={yf_val}")
+                        return yf_val
+                    else:
+                        # yfinance is also 0.0 or None, so we stick with AV's 0.0
+                        return av_val
+                return av_val
+
+            # AlphaVantage totally missing, use whatever yfinance has
+            return yf_val
 
         # Extracting current price
         current_price = _get_float_metric("05. price", "currentPrice", av_quote)
@@ -120,13 +150,13 @@ class FinancialDataProvider:
     @tool
     @staticmethod
     def get_asset_data(ticker: str) -> Optional[Asset]:
-        """Fetch data from yfinance using the stock ticker and return an Asset instance."""
+        """Fetch data from AlphaVantage and yfinance using the stock ticker and return an Asset instance."""
         return FinancialDataProvider._get_asset_data(ticker)
 
     @tool
     @staticmethod
     def get_multiple_assets(tickers: List[str]) -> List[Asset]:
-        """Fetch multiple assets from yfinance using the stock tickers and return a list of Asset instances."""
+        """Fetch multiple assets from AlphaVantage and yfinance using the stock tickers and return a list of Asset instances."""
         assets = []
         logger.info(f'Fetching data for {tickers}...')
         for ticker in tickers:

@@ -105,13 +105,16 @@ class ValuationModel(BaseModel):
         print(model.expected_cagr)
     """
     ticker: str = Field(..., description="Stock ticker symbol e.g. AAPL")
+    exchange: Optional[str] = Field(default=None, description="Stock exchange e.g. NASDAQ, NYSE, AS")
     company: str = Field(..., description="Company name e.g. Apple Inc.")
     last_updated: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = Field(default=None, description="DB-managed timestamp of last persistence to Supabase")
     current_price: float = Field(..., description="Current market price per share")
     currency: str = "USD"
     base_revenue: float = Field(..., description="Trailing twelve months (TTM) revenue")
     shares_outstanding: float = Field(..., description="Total diluted shares outstanding")
-    holding_period_years: int = Field(5, description="Default holding period for CAGR computation")
+    thesis_data: Optional[Dict] = Field(default=None, description="Qualitative thesis synthesis")
+    valuation_data: Optional[Dict] = Field(default=None, description="JSON dictionary of the valuation result")
 
     scenarios: Dict[str, DCFScenario] = Field(
         ...,

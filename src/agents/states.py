@@ -23,6 +23,7 @@ class ResearchState(TypedDict):
     company: str
     ticker: str
     price_data: Optional[Asset]
+    existing_valuation: Optional[ValuationModel]  # Prior valuation from Supabase, if any
     max_iterations: int
     iteration_count: Annotated[int, operator.add]
     research_topics: list[str]

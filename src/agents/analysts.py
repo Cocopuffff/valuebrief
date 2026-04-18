@@ -1,19 +1,14 @@
 import json
-from langchain_openrouter import ChatOpenRouter
 from langchain.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
 from typing import Any, Literal
 
-from models import AgentNode
+from models import AgentNode, ValuationModel
 from .states import ResearchState
 from provider import FinancialDataProvider
 from logger import get_logger
+from config import bull_model, bear_model
 
 logger = get_logger(__name__)
-
-model = ChatOpenRouter(
-    model="qwen/qwen3.6-plus",
-    temperature=0.2
-)
 
 research_tools = [
     # FinancialDataProvider.get_asset_data,
@@ -24,7 +19,8 @@ research_tools = [
 ]
 
 research_tools_by_name = {tool.name: tool for tool in research_tools}
-model_with_tools = model.bind_tools(research_tools)
+bull_model_with_tools = bull_model.bind_tools(research_tools)
+bear_model_with_tools = bear_model.bind_tools(research_tools)
 
 
 # ── Context management helpers ────────────────────────────────────────────
@@ -141,6 +137,46 @@ def _extract_text(content) -> str:
     return str(content)
 
 
+# ── Prior valuation context helper ───────────────────────────────────────
+
+def _build_prior_valuation_context(valuation: ValuationModel | None) -> str:
+    """Build a concise summary of a prior valuation for analyst prompts.
+    
+    Returns an empty string if no prior valuation exists, so the prompt
+    reads cleanly without a placeholder block.
+    """
+    if not valuation:
+        return ""
+
+    from datetime import datetime, timezone
+    age_str = "unknown age"
+    if valuation.updated_at:
+        delta = datetime.now(timezone.utc) - valuation.updated_at
+        days = delta.days
+        if days == 0:
+            age_str = "updated today"
+        elif days == 1:
+            age_str = "1 day old"
+        else:
+            age_str = f"{days} days old"
+
+    scenario_lines = []
+    for label, s in valuation.scenarios.items():
+        iv = f"${s.intrinsic_value:,.2f}" if s.intrinsic_value else "N/A"
+        scenario_lines.append(f"  - {label} ({s.probability:.0%}): IV = {iv}")
+    scenarios_block = "\n".join(scenario_lines)
+
+    cagr = f"{valuation.expected_cagr:.1%}" if valuation.expected_cagr else "N/A"
+
+    return (
+        f"\n\nPRIOR VALUATION ({age_str}, recommendation: {valuation.recommendation}):\n"
+        f"Expected Intrinsic Value: ${valuation.expected_value:,.2f} vs Current Price: ${valuation.current_price:,.2f}\n"
+        f"Expected CAGR: {cagr}\n"
+        f"Scenarios:\n{scenarios_block}\n"
+        f"Use this as context — challenge or confirm these assumptions with your research."
+    )
+
+
 # ── Logging helpers ──────────────────────────────────────────────────────
 
 def _log_response(label: str, response: AIMessage) -> None:
@@ -163,7 +199,7 @@ RESEARCH METHODOLOGY — follow this workflow each iteration:
 4. Synthesize what you've learned so far.
 
 IMPORTANT: search and get_latest_news only return headlines and short snippets. You MUST call scrape_website on promising URLs to get the actual article content needed for a serious thesis.
-
+{prior_valuation}
 Your thesis should address: margin of safety, intrinsic value drivers, competitive moat, growth catalysts, and risk/reward asymmetry."""
 
 BEAR_SYSTEM = """You are a bearish equity analyst grounded in value investing principles. You are researching {company} ({ticker}) to build the strongest possible case for selling or avoiding it. Today is {date}. You have {remaining} research iterations remaining.
@@ -175,24 +211,26 @@ RESEARCH METHODOLOGY — follow this workflow each iteration:
 4. Synthesize what you've learned so far.
 
 IMPORTANT: search and get_latest_news only return headlines and short snippets. You MUST call scrape_website on promising URLs to get the actual article content needed for a serious thesis.
-
+{prior_valuation}
 Your thesis should address: overvaluation risks, margin of safety concerns, competitive threats, earnings quality issues, and downside catalysts."""
 
 
-def bull_analyst(state: ResearchState) -> dict:
+async def bull_analyst(state: ResearchState) -> dict:
     """Bull analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
     remaining = state['max_iterations'] - iteration
     logger.info(f"[Bull Analyst] Iteration {iteration} ({remaining} remaining)")
 
     if iteration < state['max_iterations']:
+        prior_valuation_ctx = _build_prior_valuation_context(state.get('existing_valuation'))
         system = BULL_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
-            date=state['date'], remaining=remaining
+            date=state['date'], remaining=remaining,
+            prior_valuation=prior_valuation_ctx,
         )
         # Trim context to avoid unbounded growth
         trimmed = _trim_messages(state['messages'])
-        response = model_with_tools.invoke(
+        response = await bull_model_with_tools.ainvoke(
             [SystemMessage(content=system)] + trimmed
         )
         _log_response("Bull Analyst", response)
@@ -234,7 +272,7 @@ Your thesis MUST adhere strictly to standard Markdown formatting rules:
 - Always use exactly one space after a list marker (e.g., '- item', not '-  item').
 
 Write a structured, substantive investment thesis. Do NOT attempt to call any tools."""
-        response: AIMessage = model.invoke(
+        response: AIMessage = await bull_model.ainvoke(
             [SystemMessage(content=final_prompt)] + thesis_messages
         )
         _log_response("Bull Analyst (Final)", response)
@@ -245,19 +283,21 @@ Write a structured, substantive investment thesis. Do NOT attempt to call any to
         }
 
 
-def bear_analyst(state: ResearchState) -> dict:
+async def bear_analyst(state: ResearchState) -> dict:
     """Bear analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
     remaining = state['max_iterations'] - iteration
     logger.info(f"[Bear Analyst] Iteration {iteration} ({remaining} remaining)")
 
     if iteration < state['max_iterations']:
+        prior_valuation_ctx = _build_prior_valuation_context(state.get('existing_valuation'))
         system = BEAR_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
-            date=state['date'], remaining=remaining
+            date=state['date'], remaining=remaining,
+            prior_valuation=prior_valuation_ctx,
         )
         trimmed = _trim_messages(state['messages'])
-        response = model_with_tools.invoke(
+        response = await bear_model_with_tools.ainvoke(
             [SystemMessage(content=system)] + trimmed
         )
         _log_response("Bear Analyst", response)
@@ -296,7 +336,7 @@ Your thesis MUST adhere strictly to standard Markdown formatting rules:
 - Always use exactly one space after a list marker (e.g., '- item', not '-  item').
 
 Write a structured, substantive investment thesis. Do NOT attempt to call any tools."""
-        response = model.invoke(
+        response = await bear_model.ainvoke(
             [SystemMessage(content=final_prompt)] + thesis_messages
         )
         _log_response("Bear Analyst (Final)", response)
@@ -309,7 +349,7 @@ Write a structured, substantive investment thesis. Do NOT attempt to call any to
 
 # ── Tool execution & routing ─────────────────────────────────────────────
 
-def research_tool_node(state: ResearchState) -> dict[str, Any]:
+async def research_tool_node(state: ResearchState) -> dict[str, Any]:
     """Executes tool calls from the last AI message."""
     result = []
     last_message = state["messages"][-1]
@@ -317,7 +357,7 @@ def research_tool_node(state: ResearchState) -> dict[str, Any]:
     if isinstance(last_message, AIMessage):
         for tool_call in last_message.tool_calls:
             tool = research_tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
+            observation = await tool.ainvoke(tool_call["args"])
             if not isinstance(observation, str):
                 observation = json.dumps(observation, default=str)
             result.append(ToolMessage(content=observation, 

@@ -1,4 +1,3 @@
-from langchain_openrouter import ChatOpenRouter
 from langgraph.types import Command
 from typing import Literal
 from .states import WorkflowState
@@ -6,19 +5,15 @@ from models import AgentNode
 from provider import *
 from logger import get_logger
 from report_writer import RunReportWriter
+from config import supervisor_model
 
 logger = get_logger(__name__)
-
-supervisor_model = ChatOpenRouter(
-    model="qwen/qwen3.6-plus",
-    temperature=0.2
-)
 
 tools = [DateTimeProvider.get_current_date, FinancialDataProvider.get_asset_data, FinancialDataProvider.get_multiple_assets]
 tools_by_name = {tool.name: tool for tool in tools}
 supervisor_model_with_tools = supervisor_model.bind_tools(tools)
 
-def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_research", "bear_research"]]:
+async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_research", "bear_research", "__end__"]]:
     """
     Supervisor coordinates the workflow and tracks progress.
     Fetches price data on first run, then logs analyst status.
@@ -26,6 +21,11 @@ def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_r
     updates = {}
     if not state.get('price_data', None):
         asset = FinancialDataProvider._get_asset_data(state["ticker"])
+        
+        if not asset or not asset.current_price or not asset.shares_outstanding or getattr(asset.fundamentals, "total_revenue", 0) in (None, 0):
+            logger.error(f"[Supervisor] ⚠️ Insufficient financial data for {state['ticker']}. Canceling analysis.")
+            return Command(goto="__end__")
+
         if asset:
             updates["price_data"] = asset
             if not state.get("company"):

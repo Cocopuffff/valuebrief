@@ -5,7 +5,6 @@ CREATE TABLE valuations (
     currency VARCHAR(10),
     base_revenue DECIMAL(20, 2),
     shares_outstanding DECIMAL(20, 2),
-    holding_period_years INTEGER,
     
     -- Relational Summary Stats
     expected_value DECIMAL(12, 2), 

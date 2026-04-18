@@ -3,7 +3,6 @@ import asyncio
 import json
 import traceback
 import os
-import logging
 from datetime import date, datetime
 from dotenv import load_dotenv
 load_dotenv()  # Must come before agent imports — they call init_chat_model at module level
@@ -14,15 +13,15 @@ from agents.states import WorkflowState
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.runtime import Runtime
 from langchain_core.runnables import RunnableConfig
+from psycopg_pool import AsyncConnectionPool
+from config import secrets
+from db import get_valuation
 
 # Initialize logger
 setup_logging()
 logger = get_logger(__name__)
 
-DB_URI = os.environ["SUPABASE_CONNECTION_STRING"]
-if "sslmode" not in DB_URI:
-    DB_URI += "?sslmode=require"
-logger.info(f"DB_URI: {DB_URI}")
+DB_URI = secrets.SUPABASE_URI
 
 async def main():
     parser = argparse.ArgumentParser(description="Value Brief: Automated Daily Digest for Portfolio Tracking")
@@ -48,7 +47,17 @@ async def main():
         logger.warning("No tickers to track.")
         return
 
-    async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
+
+    connection_kwargs = {
+        "autocommit": True,
+        "prepare_threshold": None,
+    }
+    async with AsyncConnectionPool(
+        conninfo=DB_URI,
+        max_size=20,
+        kwargs=connection_kwargs,
+    ) as pool:
+        checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
         workflow = build_research_workflow(checkpointer=checkpointer)
 
@@ -59,6 +68,11 @@ async def main():
                     "configurable": {"thread_id": f"{ticker}-{run_dt}"}
                 }
                 logger.info(f"Starting agentic analysis for {ticker}...")
+                # Check if valuation already exists
+                existing_valuation = await get_valuation(ticker)
+                if existing_valuation:
+                    logger.info(f"Found existing valuation for {ticker}. Using existing valuation.")
+
                 state: WorkflowState = {
                     "date": date.today().isoformat(),
                     "run_datetime": run_dt,
@@ -69,7 +83,7 @@ async def main():
                     "bear_thesis": "",
                     "sources": [],
                     "judge_decision": "",
-                    "valuation": None,
+                    "valuation": existing_valuation,
                     "final_report": "",
                 }
 

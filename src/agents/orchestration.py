@@ -12,6 +12,8 @@ from agents.judge import judge_analyst, _build_dcf_summary
 from models import AgentNode
 from logger import get_logger
 from report_writer import RunReportWriter
+from db import upsert_valuation
+from config import config
 import json
 
 logger = get_logger(__name__)
@@ -63,13 +65,14 @@ bear_subgraph_builder.add_edge(AgentNode.RESEARCH_TOOL_NODE, AgentNode.BEAR)
 bear_subgraph = bear_subgraph_builder.compile()
 
 # —— Wrapper functions (bridge WorkflowState ↔ ResearchState) ——
-def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
+async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
     research_input: ResearchState = {
         "date": state["date"],
         "company": state["company"],
         "ticker": state["ticker"],
         "price_data": state["price_data"],
-        "max_iterations": 10,
+        "existing_valuation": state.get("valuation"),
+        "max_iterations": config.bull.max_iterations,
         "iteration_count": 0,
         "research_topics": [],
         "key_points": [],
@@ -77,7 +80,7 @@ def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVI
         "sources": [],
         "messages": [],
     }
-    result = bull_subgraph.invoke(research_input)
+    result = await bull_subgraph.ainvoke(research_input)
     update = {"bull_thesis": result["thesis"], "sources": state["sources"] + result["sources"]}
 
     # Persist bull thesis to run artifact
@@ -92,13 +95,14 @@ def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVI
 
     return Command(update=update, goto=AgentNode.SUPERVISOR)
 
-def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
+async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
     research_input: ResearchState = {
         "date": state["date"],
         "company": state["company"],
         "ticker": state["ticker"],
         "price_data": state["price_data"],
-        "max_iterations": 10,
+        "existing_valuation": state.get("valuation"),
+        "max_iterations": config.bear.max_iterations,
         "iteration_count": 0,
         "research_topics": [],
         "key_points": [],
@@ -106,7 +110,7 @@ def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVI
         "sources": [],
         "messages": [],
     }
-    result = bear_subgraph.invoke(research_input)
+    result = await bear_subgraph.ainvoke(research_input)
     update = {"bear_thesis": result["thesis"], "sources": state["sources"] + result["sources"]}
 
     # Persist bear thesis to run artifact
@@ -121,7 +125,7 @@ def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVI
 
     return Command(update=update, goto=AgentNode.SUPERVISOR)
 
-def report_generator(state: WorkflowState) -> Command[Literal["__end__"]]:
+async def report_generator(state: WorkflowState) -> Command[Literal["__end__"]]:
     """Generate the final investment report including valuation results."""
     logger.info(f"Generating final report for {state['company']}...")
 
@@ -159,7 +163,7 @@ SOURCES:
 {sources_formatted}
 
 WORKFLOW_STATE:
-{json.dumps(state, indent=2)}
+{json.dumps(state, indent=2, default=str)}
 """
 
     report = f"""
@@ -177,6 +181,13 @@ SOURCES:
             writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
             writer.write_final_report(debug_report, report, unique_sources)
             logger.info(f"[Report Generator] 📝 Written final report to {writer.final_path}")
+            if valuation:
+                await upsert_valuation(valuation)
+                logger.info(f"[Report Generator] 📝 Upserted valuation for {state['ticker']} to database")
+            else:
+                logger.warning(f"[Report Generator] ⚠️ No valuation data available for {state['ticker']}")
+        except TimeoutError:
+            logger.warning(f"[Report Generator] ⚠️ Timed out writing final report for {state['ticker']}")
         except Exception as e:
             logger.warning(f"[Report Generator] ⚠️ Failed to write final report: {e}")
 
