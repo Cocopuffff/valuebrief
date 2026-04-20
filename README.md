@@ -61,9 +61,7 @@ graph TD
 
 > Completed: 2026-04-12T01:06:59.965264
 
-══════════════════════════════════════════════════
-INVESTMENT REPORT: Generic Corp (GNC)
-══════════════════════════════════════════════════
+### Investment Report: Generic Corp (GNC)
 
 ### Investment Thesis
 
@@ -77,9 +75,7 @@ INVESTMENT REPORT: Generic Corp (GNC)
 - Prolonged leadership vacuum delaying strategic capital allocation.
 - Competitive disruption from AI-native platforms capturing mid-market share.
 
-──────────────────────────────────────────────────
-DCF VALUATION
-──────────────────────────────────────────────────
+### DCF Valuation
 
 | Scenario | Probability | Intrinsic Value | Margin of Safety |
 | :------- | :---------- | :-------------- | :--------------- |
