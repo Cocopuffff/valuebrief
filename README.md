@@ -1,6 +1,6 @@
 # Value Brief
 
-Value Brief: Covering your assets. An automated daily digest tracking intrinsic value, margin of safety, and portfolio fundamentals.
+Value Brief: Covering your assets. An automated daily digest that accumulates insights on your assets and tracks intrinsic value, margin of safety, and portfolio fundamentals.
 
 ## Architecture
 
@@ -65,31 +65,32 @@ graph TD
 INVESTMENT REPORT: Generic Corp (GNC)
 ══════════════════════════════════════════════════
 
-BULL THESIS:
-Generic Corp demonstrates formidable runway through aggressive multi-stage scaling. Expanding gross margins align flawlessly with their cloud software transitions alongside impressive ARR retention metrics...
+### Investment Thesis
 
-BEAR THESIS:
-Despite current revenue bumps, mounting CapEx costs risk sinking free cash flow profiles dramatically if enterprise uptake falters amidst tightened macroeconomic cycles...
+**Verdict** — Strong Buy on weakness, targeting a probability-weighted intrinsic value of approximately $408 per share.
 
-JUDGE DECISION:
-Generic Corp sits at a reasonable discount with significant margin of safety. Current speculative headwinds offer favourable asymmetry despite near-term volatility...
+**Rationale** — Generic Corp’s core investment case remains anchored in its entrenched enterprise workflow dominance and commercially indemnified AI architecture... the qualitative reality points to a deliberate monetization pivot from volume-based subscriptions to value-driven AI credit consumption. The current disconnect between Generic Corp’s durable cash generation and its compressed valuation multiple represents a classic transitional mispricing.
+
+### Key Risks
+
+- Accelerated enterprise seat consolidation outpacing AI credit monetization.
+- Prolonged leadership vacuum delaying strategic capital allocation.
+- Competitive disruption from AI-native platforms capturing mid-market share.
 
 ──────────────────────────────────────────────────
 DCF VALUATION
 ──────────────────────────────────────────────────
 
-**Expected Base CAGR:** ~ 12.3%  
-**Recommended Strategy:** Buy
+| Scenario | Probability | Intrinsic Value | Margin of Safety |
+| :------- | :---------- | :-------------- | :--------------- |
+| Bear     | 25%         | $225.56         | -10.1%           |
+| **Base** | **50%**     | **$380.93**     | **34.8%**        |
+| Bull     | 25%         | $643.82         | 61.4%            |
 
-### Final Intrinsic Value Spread
-
-| Scenario | Probability | Intrinsic Value | vs Market Price |
-| -------- | ----------- | --------------- | --------------- |
-| Bear     | 20.0%       | $ 85.00         | -15.0%          |
-| Base     | 60.0%       | $ 115.00        | +15.0%          |
-| Bull     | 20.0%       | $ 150.00        | +50.0%          |
-
-_Note: Models execute multi-stage revenue scaling against standard WACC calculations resulting in independent Terminal Value profiles over 10 years._
+**Expected Intrinsic Value:** $407.81  
+**Current Price:** $248.39  
+**Expected 5-Year CAGR:** 16.4%  
+**Recommendation:** Strong Buy
 
 ---
 
