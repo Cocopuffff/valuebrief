@@ -1,6 +1,5 @@
 import os
 import yfinance as yf
-import pandas as pd
 from typing import List, Optional, Any
 from datetime import date, datetime
 from models import Asset, FinancialMetrics
@@ -8,7 +7,7 @@ from langchain.tools import tool
 from ddgs import DDGS
 import httpx
 from markdownify import markdownify
-from logger import get_logger
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -215,6 +214,7 @@ class FinancialDataProvider:
     @staticmethod
     def _scrape_url(url: str, max_chars: int = 5000) -> str:
         """Internal scraping method. Truncates to max_chars to keep LLM context manageable."""
+        logger.info(f"Scraping URL: {url}...")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }

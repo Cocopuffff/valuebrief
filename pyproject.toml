@@ -72,4 +72,5 @@ dependencies = [
     "markdownify>=1.2.2",
     "psycopg[async,binary,pool]>=3.3.3",
     "langgraph-checkpoint-postgres>=3.0.5",
+    "langchain-google-genai>=4.2.1",
 ]

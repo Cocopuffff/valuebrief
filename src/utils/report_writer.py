@@ -14,7 +14,7 @@ the second simply overwrites the first.
 
 from __future__ import annotations
 
-import os
+import pathlib
 from datetime import datetime
 
 
@@ -48,10 +48,11 @@ class RunReportWriter:
         writer.write_final_report(report_text, sources)
     """
 
-    def __init__(self, ticker: str, run_datetime: str) -> None:
+    def __init__(self, ticker: str, company: str, run_datetime: str) -> None:
         """
         Args:
             ticker:       Stock ticker symbol, e.g. 'ADBE'.
+            company:      Company name, e.g. 'Adobe Inc.'.
             run_datetime: ISO datetime string from datetime.now().isoformat(),
                           matching the thread_id used in main.py.
         """
@@ -59,14 +60,14 @@ class RunReportWriter:
         self.run_datetime = run_datetime
 
         # Resolve path relative to this file: src/ → project root → logs/runs/
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        runs_dir = os.path.join(project_root, "logs", "runs")
-        os.makedirs(runs_dir, exist_ok=True)
+        project_root = pathlib.Path(__file__).parent.parent.parent
+        runs_dir = project_root / "logs" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
 
         debug_filename = f"{self.ticker}_debug_{_safe_iso(run_datetime)}.md"
         final_filename = f"{self.ticker}_{_safe_iso(run_datetime)}.md"
-        self.debug_path = os.path.join(runs_dir, debug_filename)
-        self.final_path = os.path.join(runs_dir, final_filename)
+        self.debug_path = runs_dir / debug_filename
+        self.final_path = runs_dir / final_filename
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -82,7 +83,7 @@ class RunReportWriter:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def write_header(self, company: str) -> None:
+    def write_header(self) -> None:
         """Create (or overwrite) the file with the run metadata header."""
         thread_id = f"{self.ticker}-{self.run_datetime}"
         header = (
@@ -93,7 +94,7 @@ class RunReportWriter:
             f"| **Thread ID** | `{thread_id}` |\n"
             f"| **Started** | {self.run_datetime} |\n"
             f"| **Ticker** | {self.ticker} |\n"
-            f"| **Company** | {company} |\n\n"
+            f"| **Company** | {self.company} |\n\n"
             f"---\n"
         )
         self._write_file(self.debug_path, header)
@@ -160,6 +161,8 @@ class RunReportWriter:
         )
         final_content = (
             f"> Completed: {datetime.now().isoformat()}\n\n"
+            f"# {self.company} - {self.ticker} Investment Report\n\n"
+            f"---\n"
             f"{report_text}\n"
         )
         self._append_file(self.debug_path, debug_content)

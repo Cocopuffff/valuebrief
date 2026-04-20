@@ -2,11 +2,11 @@ import json
 from langchain.messages import SystemMessage, HumanMessage
 from langgraph.types import Command
 from typing import Literal
-from .states import WorkflowState
+from agents.states import WorkflowState
 from models import ValuationModel, AgentNode
-from logger import get_logger
-from report_writer import RunReportWriter
-from config import judge_model, valuation_model
+from utils.logger import get_logger, log_node_execution
+from utils.report_writer import RunReportWriter
+from utils.config import judge_model, valuation_model
 
 logger = get_logger(__name__)
 
@@ -81,23 +81,23 @@ Respond ONLY with the JSON object. No commentary, no markdown fences, no explana
 """
 
 RECONCILE_SYSTEM = """\
-You are the lead investment analyst for {company} ({ticker}). You previously wrote a \
-qualitative synthesis of the bull and bear cases. The quantitative DCF valuation has \
-now been computed from assumptions you derived.
+You are the lead investment analyst for {company} ({ticker}). This is a DAILY \
+investment update. You must accumulate, prune, and evolve the investment thesis over time.
 
-Review the qualitative synthesis alongside the DCF outputs below. Your job is to \
-produce a FINAL investment decision that reconciles any tension between the qualitative \
-sentiment and the quantitative reality.
+You will receive:
+1. **Prior Investment Thesis**: Your final decision from the previous update (if any). \
+This is your FOUNDATION.
+2. **New Qualitative Synthesis**: A summary of today's bull and bear arguments.
+3. **New DCF Valuation Results**: The updated quantitative realities.
 
-For example:
-- If your synthesis was bullish but the stock trades ABOVE even the bull-case intrinsic \
-  value, flag the valuation risk and recommend patience.
-- If your synthesis was cautious but the DCF shows significant upside with wide margin \
-  of safety, acknowledge the quantitative case.
+Your job is to produce an UPDATED investment thesis that reconciles any tension \
+between the qualitative sentiment and the quantitative reality. Do NOT just summarize the DCF math! \
+Instead, integrate the previous thesis with today's new facts. Prune stale information \
+and accumulate new insights.
 
 Structure your response as:
 1. **Verdict** — one sentence (e.g. "Buy on weakness" / "Hold" / "Avoid").
-2. **Rationale** — 2-3 paragraphs integrating qualitative and quantitative views.
+2. **Rationale** — 2-3 paragraphs integrating the prior ongoing thesis with the new qualitative and quantitative insights. Focus on business fundamentals and valuation multiples, NOT specific year-by-year math.
 3. **Key Risks** — bullet list of the most important risks to your thesis.
 
 Do NOT call any tools. Respond with plain text only.\
@@ -210,18 +210,34 @@ def _build_dcf_summary(valuation: ValuationModel) -> str:
         )
         
         tv = s.terminal_value_details
-        tv_block = (
-            f"\n\n**Terminal Value — Perpetuity Growth Method**\n\n"
-            f"```\n"
-            f"         NOPAT₁₀ × (1 + g)        ${tv.terminal_nopat/1000000:,.1f}M\n"
-            f"TV  =  ─────────────────────  =  ────────────────────────  =  ${tv.terminal_value/1000000:,.1f}M\n"
-            f"             WACC − g              {s.assumptions.wacc:.1%} − {s.assumptions.terminal_growth:.1%}\n\n"
-            f"           TV          ${tv.terminal_value/1000000:,.1f}M\n"
-            f"PV  =  ──────────  =  ──────────────────────  =  ${tv.pv_terminal/1000000:,.1f}M\n"
-            f"        (1+WACC)¹⁰     (1 + {s.assumptions.wacc:.1%})¹⁰\n"
-            f"```"
-            if tv else ""
-        )
+        if tv:
+            sum_pv_fcf = sum(row['pv_fcf'] for row in s.dcf_table)
+            ev = sum_pv_fcf + tv.pv_terminal
+            shares_out_m = valuation.shares_outstanding / 1000000
+            
+            tv_block = (
+                f"\n\n**Terminal Value & Intrinsic Value Calculation**\n\n"
+                f"```text\n"
+                f"         NOPAT₁₀ × (1 + g)        ${tv.terminal_nopat/1000000:,.1f}M\n"
+                f"TV  =  ─────────────────────  =  ────────────────────────  =  ${tv.terminal_value/1000000:,.1f}M\n"
+                f"             WACC − g              {s.assumptions.wacc:.1%} − {s.assumptions.terminal_growth:.1%}\n\n"
+                f"           TV          ${tv.terminal_value/1000000:,.1f}M\n"
+                f"PV  =  ──────────  =  ──────────────────────  =  ${tv.pv_terminal/1000000:,.1f}M\n"
+                f"        (1+WACC)¹⁰     (1 + {s.assumptions.wacc:.1%})¹⁰\n\n"
+                f"Sum of PV(FCF) Years 1-10 :  ${sum_pv_fcf/1000000:,.1f}M\n"
+                f"Plus PV of Terminal Value :  ${tv.pv_terminal/1000000:,.1f}M\n"
+                f"────────────────────────────────────────────────────────\n"
+                f"Enterprise Value          :  ${ev/1000000:,.1f}M\n"
+                f"÷ Shares Outstanding      :   {shares_out_m:,.1f}M\n"
+                f"────────────────────────────────────────────────────────\n"
+                f"Intrinsic Value per Share :  ${s.intrinsic_value:,.2f}\n"
+                f"```\n"
+                f"*(Note: Intrinsic value assumes a static share count. The mechanical effect of "
+                f"potential future share buybacks—which would naturally reduce shares outstanding "
+                f"and increase per-share value—is not modeled, providing an additional margin of safety.)*"
+            )
+        else:
+            tv_block = ""
         
         projection_blocks.append(
             assumptions_block + "\n\n" +
@@ -246,8 +262,47 @@ def _build_dcf_summary(valuation: ValuationModel) -> str:
     return f"{scenario_table}\n\n{projections_section}\n\n{summary}"
 
 
+def _build_dcf_summary_for_judge(valuation: ValuationModel) -> str:
+    """Build a truncated Markdown summary of DCF results exclusively for the Judge context.
+    
+    Excludes the year-by-year projections to prevent the LLM from focusing too heavily
+    on mathematical line items rather than the overall thesis."""
+    cagr = valuation.expected_cagr
+    cagr_str = f"{cagr:.1%}" if cagr is not None else "N/A"
+
+    scenario_rows = []
+    for label, s in valuation.scenarios.items():
+        margin = valuation.scenario_margins.get(label)
+        margin_str = f"{margin:.1%}" if margin is not None else "N/A"
+        iv_str = f"${s.intrinsic_value:,.2f}" if s.intrinsic_value is not None else "N/A"
+        
+        a = s.assumptions
+        assumptions_str = (
+            f"Growth(Y1-5): {a.revenue_growth_stage_1:.1%}, Growth(Y6-10): {a.revenue_growth_stage_2:.1%}, "
+            f"EBIT Margin: {a.ebit_margin_target:.1%}, Term Growth: {a.terminal_growth:.1%}"
+        )
+        
+        scenario_rows.append(
+            f"**{label}** (Prob: {s.probability:.0%}) | IV: {iv_str} | Margin of Safety: {margin_str}\n"
+            f"  *Assumptions*: {assumptions_str}"
+        )
+
+    scenarios_text = "\n\n".join(scenario_rows)
+
+    summary = (
+        f"**Expected Intrinsic Value**: ${valuation.expected_value:,.2f}  \n"
+        f"**Current Price**: ${valuation.current_price:,.2f}  \n"
+        f"**Expected 5-Year CAGR**: {cagr_str}  \n"
+        f"**Dispersion Ratio**: {valuation.dispersion_ratio:.2f}  \n"
+        f"**Recommendation**: {valuation.recommendation}"
+    )
+
+    return f"### DCF Scenarios\n{scenarios_text}\n\n### Valuation Summary\n{summary}"
+
+
 # ── Main node ────────────────────────────────────────────────────────────
 
+@log_node_execution
 async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPORT_GENERATOR]]:
     """
     Three-step judge node: synthesise → valuate → reconcile.
@@ -342,14 +397,6 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
             valuation = _parse_valuation_response(raw_text, state)
             base_year = int(state["date"][:4])
             valuation.compute_dcf(base_year=base_year)
-            
-            # Save our synthesized elements into the JSONB payloads for the database
-            valuation.thesis_data = {
-                "synthesis": initial_synthesis,
-                "bull": state.get("bull_thesis"),
-                "bear": state.get("bear_thesis")
-            }
-            valuation.valuation_data = valuation.model_dump(mode="json")
 
             logger.info(f"[Judge] ✅ Valuation complete — Expected Value: ${valuation.expected_value:.2f}")
             logger.info(f"[Judge]    Recommendation: {valuation.recommendation}")
@@ -383,13 +430,21 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         company=state["company"],
         ticker=state["ticker"],
     )
-    dcf_summary = _build_dcf_summary(valuation)
+    
+    prior_thesis = "No prior thesis available. This is the initial analysis."
+    prior_valuation = state.get("valuation")
+    if prior_valuation and prior_valuation.thesis_data:
+        prior_thesis = prior_valuation.thesis_data.get("final_decision", prior_thesis)
+        
+    dcf_summary_for_judge = _build_dcf_summary_for_judge(valuation)
+    
     reconcile_messages = [
         SystemMessage(content=reconcile_prompt),
         HumanMessage(
             content=(
-                f"## Your Previous Synthesis\n{initial_synthesis}\n\n"
-                f"## DCF Valuation Results\n{dcf_summary}"
+                f"## Prior Investment Thesis\n{prior_thesis}\n\n"
+                f"## New Qualitative Synthesis\n{initial_synthesis}\n\n"
+                f"## New DCF Valuation Results\n{dcf_summary_for_judge}"
             )
         ),
     ]
@@ -397,6 +452,16 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
     final_decision = reconcile_response.content
     logger.info("[Judge] ✅ Reconciliation complete")
     logger.debug(f"[Judge] Final decision snippet: {final_decision[:200]}...")
+
+    # Save our synthesized elements into the JSONB payloads for the database NOW
+    if valuation is not None:
+        valuation.thesis_data = {
+            "synthesis": initial_synthesis,
+            "bull": state.get("bull_thesis") or "",
+            "bear": state.get("bear_thesis") or "",
+            "final_decision": final_decision if isinstance(final_decision, str) else str(final_decision)
+        }
+        valuation.valuation_data = valuation.model_dump(mode="json")
 
     # ── Persist judge output to run artifact ────────────────────────────
     run_dt = state.get("run_datetime", "")

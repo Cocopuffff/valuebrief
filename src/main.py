@@ -2,20 +2,19 @@ import argparse
 import asyncio
 import json
 import traceback
-import os
 from datetime import date, datetime
+from typing import Any
 from dotenv import load_dotenv
 load_dotenv()  # Must come before agent imports — they call init_chat_model at module level
 
-from logger import setup_logging, get_logger
+from utils.logger import setup_logging, get_logger
 from agents.orchestration import build_research_workflow
 from agents.states import WorkflowState
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.runtime import Runtime
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
-from config import secrets
-from db import get_valuation
+from utils.config import secrets
+from utils.db import get_valuation
 
 # Initialize logger
 setup_logging()
@@ -57,6 +56,7 @@ async def main():
         max_size=20,
         kwargs=connection_kwargs,
     ) as pool:
+        pool: AsyncConnectionPool[Any]
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
         workflow = build_research_workflow(checkpointer=checkpointer)

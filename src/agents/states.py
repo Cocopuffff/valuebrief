@@ -3,7 +3,6 @@ from typing_extensions import Annotated, TypedDict
 from provider import Asset
 from models import ValuationModel
 import operator
-from datetime import date
 
 class WorkflowState(TypedDict):
     date: str
@@ -13,7 +12,7 @@ class WorkflowState(TypedDict):
     price_data: Optional[Asset]
     bull_thesis: str
     bear_thesis: str
-    sources: list[str]
+    sources: Annotated[list[str], operator.add]
     judge_decision: str
     valuation: Optional[ValuationModel]
     final_report: str
@@ -29,7 +28,7 @@ class ResearchState(TypedDict):
     research_topics: list[str]
     key_points: list[str]
     thesis: str
-    sources: list[str]
+    sources: Annotated[list[str], operator.add]
     messages: Annotated[list[str], operator.add]
 
 class Context:

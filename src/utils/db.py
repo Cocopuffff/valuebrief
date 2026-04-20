@@ -1,17 +1,16 @@
-import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from typing import Optional
-from config import secrets
+from typing import Optional, Any
 from models import ValuationModel
-from logger import get_logger
+from utils.config import secrets
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _pool = None
 
-async def get_pool() -> AsyncConnectionPool:
+async def get_pool() -> AsyncConnectionPool[Any]:
     global _pool
     if _pool is None:
         _pool = AsyncConnectionPool(conninfo=secrets.SUPABASE_URI, max_size=10, kwargs={"prepare_threshold": None}, open=False)

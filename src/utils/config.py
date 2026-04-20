@@ -1,8 +1,8 @@
 import os
 from enum import Enum
 from dotenv import load_dotenv
-from logger import get_logger
-from pydantic import BaseModel, Field
+from utils.logger import get_logger
+from pydantic import BaseModel, Field, SecretStr
 
 logger = get_logger(__name__)
 load_dotenv()
@@ -79,7 +79,7 @@ def get_llm(config: AgentConfig):
             return ChatOpenAI(
                 model=config.model,
                 temperature=config.temperature,
-                api_key=os.environ.get("GEMINI_API_KEY", "dummy"),
+                api_key=SecretStr(os.environ.get("GEMINI_API_KEY", "dummy")),
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
             )
     else:

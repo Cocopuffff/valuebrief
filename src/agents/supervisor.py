@@ -1,11 +1,11 @@
 from langgraph.types import Command
 from typing import Literal
-from .states import WorkflowState
+from agents.states import WorkflowState
 from models import AgentNode
 from provider import *
-from logger import get_logger
-from report_writer import RunReportWriter
-from config import supervisor_model
+from utils.logger import get_logger, log_node_execution
+from utils.report_writer import RunReportWriter
+from utils.config import supervisor_model
 
 logger = get_logger(__name__)
 
@@ -13,6 +13,7 @@ tools = [DateTimeProvider.get_current_date, FinancialDataProvider.get_asset_data
 tools_by_name = {tool.name: tool for tool in tools}
 supervisor_model_with_tools = supervisor_model.bind_tools(tools)
 
+@log_node_execution
 async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_research", "bear_research", "__end__"]]:
     """
     Supervisor coordinates the workflow and tracks progress.
@@ -47,18 +48,16 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
 
     logger.info(f"STATUS - Bull: {'COMPLETE' if bull_done else 'INCOMPLETE'}, Bear: {'COMPLETE' if bear_done else 'INCOMPLETE'}")
 
-    goto = AgentNode.JUDGE
-    incomplete = True
+    goto = []
     if not bull_done:
-        goto = "bull_research"
-    elif not bear_done:
-        goto = "bear_research"
-    else:
-        incomplete = False
+        goto.append("bull_research")
+    if not bear_done:
+        goto.append("bear_research")
     
-    if incomplete:
+    if goto:
         logger.info(f"Routing to: {goto}") 
     else:
+        goto = AgentNode.JUDGE
         logger.info("Theses complete. Routing to Judge.")
 
     return Command(update=updates, goto=goto)

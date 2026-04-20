@@ -8,13 +8,12 @@ from typing import Literal
 from agents.states import WorkflowState, ResearchState
 from agents.supervisor import supervisor
 from agents.analysts import bull_analyst, bear_analyst, research_tool_node
-from agents.judge import judge_analyst, _build_dcf_summary
+from agents.judge import judge_analyst
+from agents.report_generator import report_generator
 from models import AgentNode
-from logger import get_logger
-from report_writer import RunReportWriter
-from db import upsert_valuation
-from config import config
-import json
+from utils.logger import get_logger
+from utils.report_writer import RunReportWriter
+from utils.config import config
 
 logger = get_logger(__name__)
 
@@ -33,36 +32,40 @@ def analyst_router(state: ResearchState) -> Literal[AgentNode.RESEARCH_TOOL_NODE
 
 
 # —— Bull analyst sub graph ——
-bull_subgraph_builder = StateGraph(ResearchState)
-bull_subgraph_builder.add_node(AgentNode.BULL, bull_analyst)
-bull_subgraph_builder.add_node(AgentNode.RESEARCH_TOOL_NODE, research_tool_node)
-bull_subgraph_builder.add_edge(START, AgentNode.BULL)
-bull_subgraph_builder.add_conditional_edges(
-    AgentNode.BULL,
-    analyst_router,
-    {
-        AgentNode.RESEARCH_TOOL_NODE: AgentNode.RESEARCH_TOOL_NODE,
-        "__end__": END,
-    }
+bull_subgraph = (
+    StateGraph(ResearchState)
+    .add_node(AgentNode.BULL, bull_analyst)
+    .add_node(AgentNode.RESEARCH_TOOL_NODE, research_tool_node)
+    .add_edge(START, AgentNode.BULL)
+    .add_conditional_edges(
+        AgentNode.BULL,
+        analyst_router,
+        {
+            AgentNode.RESEARCH_TOOL_NODE: AgentNode.RESEARCH_TOOL_NODE,
+            "__end__": END,
+        },
+    )
+    .add_edge(AgentNode.RESEARCH_TOOL_NODE, AgentNode.BULL)
+    .compile()
 )
-bull_subgraph_builder.add_edge(AgentNode.RESEARCH_TOOL_NODE, AgentNode.BULL)
-bull_subgraph = bull_subgraph_builder.compile()
 
 # —— Bear analyst sub graph ——
-bear_subgraph_builder = StateGraph(ResearchState)
-bear_subgraph_builder.add_node(AgentNode.BEAR, bear_analyst)
-bear_subgraph_builder.add_node(AgentNode.RESEARCH_TOOL_NODE, research_tool_node)
-bear_subgraph_builder.add_edge(START, AgentNode.BEAR)
-bear_subgraph_builder.add_conditional_edges(
-    AgentNode.BEAR,
-    analyst_router,
-    {
-        AgentNode.RESEARCH_TOOL_NODE: AgentNode.RESEARCH_TOOL_NODE,
-        "__end__": END,
-    }
+bear_subgraph = (
+    StateGraph(ResearchState)
+    .add_node(AgentNode.BEAR, bear_analyst)
+    .add_node(AgentNode.RESEARCH_TOOL_NODE, research_tool_node)
+    .add_edge(START, AgentNode.BEAR)
+    .add_conditional_edges(
+        AgentNode.BEAR,
+        analyst_router,
+        {
+            AgentNode.RESEARCH_TOOL_NODE: AgentNode.RESEARCH_TOOL_NODE,
+            "__end__": END,
+        },
+    )
+    .add_edge(AgentNode.RESEARCH_TOOL_NODE, AgentNode.BEAR)
+    .compile()
 )
-bear_subgraph_builder.add_edge(AgentNode.RESEARCH_TOOL_NODE, AgentNode.BEAR)
-bear_subgraph = bear_subgraph_builder.compile()
 
 # —— Wrapper functions (bridge WorkflowState ↔ ResearchState) ——
 async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
@@ -125,76 +128,6 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
 
     return Command(update=update, goto=AgentNode.SUPERVISOR)
 
-async def report_generator(state: WorkflowState) -> Command[Literal["__end__"]]:
-    """Generate the final investment report including valuation results."""
-    logger.info(f"Generating final report for {state['company']}...")
-
-    # ── Valuation section ──
-    valuation = state.get("valuation")
-    if valuation:
-        valuation_section = f"""
-{'─'*50}
-DCF VALUATION
-{'─'*50}
-
-{_build_dcf_summary(valuation)}
-"""
-    else:
-        valuation_section = "\n(Valuation data unavailable)\n"
-
-    # ── Deduplicate and format sources using a set ──
-    unique_sources = sorted(list(set(state.get("sources", []))))
-    sources_formatted = "\n".join(f"- {s}" for s in unique_sources) if unique_sources else "N/A"
-
-    debug_report = f"""
-DEBUG REPORT: {state['company']} ({state['ticker']})
-
-BULL THESIS:
-{state.get('bull_thesis', 'N/A')}
-
-BEAR THESIS:
-{state.get('bear_thesis', 'N/A')}
-
-JUDGE DECISION:
-{state.get('judge_decision', 'N/A')}
-{valuation_section}
-
-SOURCES:
-{sources_formatted}
-
-WORKFLOW_STATE:
-{json.dumps(state, indent=2, default=str)}
-"""
-
-    report = f"""
-INVESTMENT THESIS:
-{state.get('judge_decision', 'N/A')}
-{valuation_section}
-
-SOURCES:
-{sources_formatted}
-"""
-    # Persist final report to run artifact
-    run_dt = state.get("run_datetime", "")
-    if run_dt:
-        try:
-            writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
-            writer.write_final_report(debug_report, report, unique_sources)
-            logger.info(f"[Report Generator] 📝 Written final report to {writer.final_path}")
-            if valuation:
-                await upsert_valuation(valuation)
-                logger.info(f"[Report Generator] 📝 Upserted valuation for {state['ticker']} to database")
-            else:
-                logger.warning(f"[Report Generator] ⚠️ No valuation data available for {state['ticker']}")
-        except TimeoutError:
-            logger.warning(f"[Report Generator] ⚠️ Timed out writing final report for {state['ticker']}")
-        except Exception as e:
-            logger.warning(f"[Report Generator] ⚠️ Failed to write final report: {e}")
-
-    return Command(update={"final_report": report}, goto="__end__")
-
-
-
 def build_research_workflow(checkpointer: AsyncPostgresSaver):
     """Main research workflow.
 
@@ -202,18 +135,16 @@ def build_research_workflow(checkpointer: AsyncPostgresSaver):
           (synthesise + valuate + reconcile) → Report Generator → END
     """
     store = InMemoryStore()
-    builder = StateGraph(WorkflowState)
-
-    builder.add_node(AgentNode.SUPERVISOR, supervisor)
-    builder.add_node("bull_research", run_bull_research)
-    builder.add_node("bear_research", run_bear_research)
-    builder.add_node(AgentNode.JUDGE, judge_analyst)
-    builder.add_node(AgentNode.REPORT_GENERATOR, report_generator)
-
-    builder.add_edge(START, AgentNode.SUPERVISOR)
-    # Supervisor uses Command(goto=...) for dynamic routing — no conditional edges needed
-    # Judge routes directly to report_generator via Command
-    builder.add_edge(AgentNode.REPORT_GENERATOR, END)
-
-    graph = builder.compile(checkpointer=checkpointer, store=store)
-    return graph
+    return (
+        StateGraph(WorkflowState)
+        .add_node(AgentNode.SUPERVISOR, supervisor)
+        .add_node("bull_research", run_bull_research)
+        .add_node("bear_research", run_bear_research)
+        .add_node(AgentNode.JUDGE, judge_analyst)
+        .add_node(AgentNode.REPORT_GENERATOR, report_generator)
+        .add_edge(START, AgentNode.SUPERVISOR)
+        # Supervisor uses Command(goto=...) for dynamic routing — no conditional edges needed
+        # Judge routes directly to report_generator via Command
+        .add_edge(AgentNode.REPORT_GENERATOR, END)
+        .compile(checkpointer=checkpointer, store=store)
+    )

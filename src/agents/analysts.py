@@ -3,10 +3,10 @@ from langchain.messages import SystemMessage, AIMessage, ToolMessage, HumanMessa
 from typing import Any, Literal
 
 from models import AgentNode, ValuationModel
-from .states import ResearchState
+from agents.states import ResearchState
 from provider import FinancialDataProvider
-from logger import get_logger
-from config import bull_model, bear_model
+from utils.logger import get_logger, log_node_execution
+from utils.config import bull_model, bear_model
 
 logger = get_logger(__name__)
 
@@ -215,6 +215,7 @@ IMPORTANT: search and get_latest_news only return headlines and short snippets. 
 Your thesis should address: overvaluation risks, margin of safety concerns, competitive threats, earnings quality issues, and downside catalysts."""
 
 
+@log_node_execution
 async def bull_analyst(state: ResearchState) -> dict:
     """Bull analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
@@ -283,6 +284,7 @@ Write a structured, substantive investment thesis. Do NOT attempt to call any to
         }
 
 
+@log_node_execution
 async def bear_analyst(state: ResearchState) -> dict:
     """Bear analyst: researches with tools, then produces a final thesis."""
     iteration = state['iteration_count']
