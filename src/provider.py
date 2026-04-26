@@ -8,14 +8,30 @@ from ddgs import DDGS
 import httpx
 from markdownify import markdownify
 from utils.logger import get_logger
+from utils.config import exchange_mappings
 
 logger = get_logger(__name__)
 
 class FinancialDataProvider:
     @staticmethod
+    def translate_ticker_for_av(ticker: str) -> str:
+        """Translate a Yahoo Finance ticker to AlphaVantage format using exchange mappings."""
+        av_ticker = ticker
+        if '.' in ticker:
+            base, suffix = ticker.rsplit('.', 1)
+            suffix = f".{suffix}"
+            if suffix in exchange_mappings:
+                av_ticker = f"{base}{exchange_mappings[suffix]}"
+        return av_ticker
+
+    @staticmethod
     def _get_asset_data(ticker: str) -> Optional[Asset]:
         """Fetch data from AlphaVantage and yfinance and return an Asset instance."""
         logger.info(f'Fetching data for {ticker}...')
+
+        av_ticker = FinancialDataProvider.translate_ticker_for_av(ticker)
+        if av_ticker != ticker:
+            logger.debug(f"Translated ticker {ticker} to {av_ticker} for AlphaVantage")
 
         av_api_key = os.getenv("ALPHAVANTAGE_API_KEY")
         av_overview = {}
@@ -24,24 +40,24 @@ class FinancialDataProvider:
         if av_api_key:
             try:
                 # Fetch Overview
-                url_overview = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={av_api_key}"
+                url_overview = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={av_ticker}&apikey={av_api_key}"
                 resp_overview = httpx.get(url_overview, timeout=10)
                 resp_overview.raise_for_status()
                 data_overview = resp_overview.json()
                 if "Symbol" in data_overview:
                     av_overview = data_overview
                 else:
-                    logger.warning(f"AlphaVantage OVERVIEW error for {ticker}: {data_overview}")
+                    logger.warning(f"AlphaVantage OVERVIEW error for {av_ticker}: {data_overview}")
 
                 # Fetch Global Quote
-                url_quote = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker}&apikey={av_api_key}"
+                url_quote = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={av_ticker}&apikey={av_api_key}"
                 resp_quote = httpx.get(url_quote, timeout=10)
                 resp_quote.raise_for_status()
                 data_quote = resp_quote.json()
                 if "Global Quote" in data_quote and "05. price" in data_quote["Global Quote"]:
                     av_quote = data_quote["Global Quote"]
                 else:
-                    logger.warning(f"AlphaVantage GLOBAL_QUOTE error for {ticker}: {data_quote}")
+                    logger.warning(f"AlphaVantage GLOBAL_QUOTE error for {av_ticker}: {data_quote}")
             except Exception as e:
                 logger.warning(f"Failed to fetch AlphaVantage data for {ticker}: {e}")
 

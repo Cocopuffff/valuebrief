@@ -155,19 +155,38 @@ Edit `.env` with the following values:
 | `LANGSMITH_API_KEY`          | LangSmith key for tracing (optional but recommended)          |
 | `*_PROVIDER` / `*_MODEL`     | Per-agent LLM provider and model overrides                    |
 
-> **Tip:** Each agent (Bull, Bear, Judge, Supervisor, Report Generator, Valuation) has its own `_PROVIDER`, `_MODEL`, and `_TEMPERATURE` variable. 
-> 
+> **Tip:** Each agent (Bull, Bear, Judge, Supervisor, Report Generator, Valuation) has its own `_PROVIDER`, `_MODEL`, and `_TEMPERATURE` variable.
+>
 > Frontier models are strongly recommended for **Bull, Bear, and Judge analysts** for the best web search, reasoning, and tool calling capabilities. Success has been found using `qwen/qwen3.6-plus` with `0.2` temperature for excellent reasoning while remaining cost-effective.
 
 ### 4. Set up your portfolio
 
-Create a `portfolio.json` file in the project root listing the tickers you want to track:
+Create a `portfolio.json` file in the project root listing the tickers you want to track.
+
+**International Stocks:** Use the [Yahoo Finance convention](https://help.yahoo.com/kb/finance-for-web/SLN2310.html) (`TICKER.EXCHANGE`) for all tickers.
 
 ```json
 {
-  "tickers": ["AAPL", "GOOGL", "MSFT"]
+  "tickers": ["AAPL", "MZH.SI", "9988.HK", "RY.TO"]
 }
 ```
+
+#### Exchange Mappings (Alpha Vantage)
+
+Since Alpha Vantage uses different exchange suffixes than Yahoo Finance, Value Brief uses a mapping file to translate them during data retrieval. You can customise these mappings in `exchange_mappings.json`:
+
+```json
+{
+  "yahoo_to_alphavantage": {
+    ".SI": ".SIN",
+    ".HK": ".HKG",
+    ".TO": ".TRT"
+  }
+}
+```
+
+> [!NOTE]
+> Alpha Vantage often lacks fundamental data (`OVERVIEW`) for international stocks. In such cases, Value Brief automatically falls back to `yfinance` to ensure your report remains complete.
 
 See `example-portfolio.json` for reference.
 

@@ -1,0 +1,11 @@
+{
+  "yahoo_to_alphavantage": {
+    ".SI": ".SIN",
+    ".TO": ".TRT",
+    ".L": ".LON",
+    ".PA": ".PAR",
+    ".F": ".FRK",
+    ".AX": ".AUS",
+    ".HK": ".HKG"
+  }
+}

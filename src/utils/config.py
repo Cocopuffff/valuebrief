@@ -1,4 +1,5 @@
 import os
+import json
 from enum import Enum
 from dotenv import load_dotenv
 from utils.logger import get_logger
@@ -106,3 +107,19 @@ judge_model = models.judge_model
 valuation_model = models.valuation_model
 
 config = models.config
+
+def load_exchange_mappings() -> dict:
+    mapping_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "exchange_mappings.json")
+    try:
+        if os.path.exists(mapping_file):
+            with open(mapping_file, "r") as f:
+                data = json.load(f)
+                return data.get("yahoo_to_alphavantage", {})
+        else:
+            logger.warning(f"exchange_mappings.json not found at {mapping_file}")
+            return {}
+    except Exception as e:
+        logger.warning(f"Failed to load exchange_mappings.json: {e}")
+        return {}
+
+exchange_mappings = load_exchange_mappings()
