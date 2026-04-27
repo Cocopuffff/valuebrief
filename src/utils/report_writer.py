@@ -51,13 +51,14 @@ class RunReportWriter:
     def __init__(self, ticker: str, company: str, run_datetime: str) -> None:
         """
         Args:
-            ticker:       Stock ticker symbol, e.g. 'ADBE'.
-            company:      Company name, e.g. 'Adobe Inc.'.
+            ticker:       Stock ticker symbol, e.g. 'ABCD'.
+            company:      Company name, e.g. 'ABCD Inc.'. Optional, falls back to ticker.
             run_datetime: ISO datetime string from datetime.now().isoformat(),
                           matching the thread_id used in main.py.
         """
         self.ticker = ticker.upper()
         self.run_datetime = run_datetime
+        self.company = company or self.ticker
 
         # Resolve path relative to this file: src/ → project root → logs/runs/
         project_root = pathlib.Path(__file__).parent.parent.parent

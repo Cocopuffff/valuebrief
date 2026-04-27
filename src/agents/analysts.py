@@ -34,7 +34,16 @@ def _trim_messages(messages: list, window_size: int = 20) -> list:
     """
     if len(messages) <= window_size:
         return messages
-    return messages[-window_size:]
+        
+    trimmed = messages[-window_size:]
+    
+    # If the window sliced off an AIMessage but kept its ToolMessages, the 
+    # API will reject the payload with a 400 error. We must drop any orphaned
+    # ToolMessages at the start of our trimmed list to maintain a valid sequence.
+    while trimmed and isinstance(trimmed[0], ToolMessage):
+        trimmed.pop(0)
+        
+    return trimmed
 
 
 def _prepare_messages_for_thesis(

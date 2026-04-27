@@ -26,39 +26,46 @@ class AgentConfig(BaseModel):
     model: str = "qwen/qwen3.6-plus"
     temperature: float = 0.2
     max_iterations: int = 2
+    thinking: bool = False  # Enable DeepSeek thinking mode (deepseek-v4-pro etc.)
 
 class ModelConfig(BaseModel):
     judge: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["JUDGE_PROVIDER"]),
         model=os.environ["JUDGE_MODEL"],
-        temperature=float(os.environ["JUDGE_TEMPERATURE"])
+        temperature=float(os.environ["JUDGE_TEMPERATURE"]),
+        thinking=os.environ.get("JUDGE_THINKING", "false").lower() == "true"
     ))
     valuation: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["VALUATION_PROVIDER"]),
         model=os.environ["VALUATION_MODEL"],
-        temperature=float(os.environ["VALUATION_TEMPERATURE"])
+        temperature=float(os.environ["VALUATION_TEMPERATURE"]),
+        thinking=os.environ.get("VALUATION_THINKING", "false").lower() == "true"
     ))
     bull: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["BULL_PROVIDER"]),
         model=os.environ["BULL_MODEL"],
         temperature=float(os.environ["BULL_TEMPERATURE"]),
-        max_iterations=int(os.environ["BULL_MAX_ITERATIONS"])
+        max_iterations=int(os.environ["BULL_MAX_ITERATIONS"]),
+        thinking=os.environ.get("BULL_THINKING", "false").lower() == "true"
     ))
     bear: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["BEAR_PROVIDER"]),
         model=os.environ["BEAR_MODEL"],
         temperature=float(os.environ["BEAR_TEMPERATURE"]),
-        max_iterations=int(os.environ["BEAR_MAX_ITERATIONS"])
+        max_iterations=int(os.environ["BEAR_MAX_ITERATIONS"]),
+        thinking=os.environ.get("BEAR_THINKING", "false").lower() == "true"
     ))
     supervisor: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["SUPERVISOR_PROVIDER"]),
         model=os.environ["SUPERVISOR_MODEL"],
-        temperature=float(os.environ["SUPERVISOR_TEMPERATURE"])
+        temperature=float(os.environ["SUPERVISOR_TEMPERATURE"]),
+        thinking=os.environ.get("SUPERVISOR_THINKING", "false").lower() == "true"
     ))
     report_generator: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["REPORT_GENERATOR_PROVIDER"]),
         model=os.environ["REPORT_GENERATOR_MODEL"],
-        temperature=float(os.environ["REPORT_GENERATOR_TEMPERATURE"])
+        temperature=float(os.environ["REPORT_GENERATOR_TEMPERATURE"]),
+        thinking=os.environ.get("REPORT_GENERATOR_THINKING", "false").lower() == "true"
     ))
 
 def get_llm(config: AgentConfig):
@@ -66,6 +73,13 @@ def get_llm(config: AgentConfig):
         from langchain_openrouter import ChatOpenRouter
         return ChatOpenRouter(model=config.model, temperature=config.temperature)
     elif config.provider == Provider.DEEPSEEK:
+        if config.thinking:
+            from utils.deepseek_thinking import ChatDeepSeekThinking
+            return ChatDeepSeekThinking(
+                model=config.model,
+                temperature=config.temperature,
+                model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
+            )
         from langchain_deepseek import ChatDeepSeek
         return ChatDeepSeek(model=config.model, temperature=config.temperature)
     elif config.provider == Provider.OPENAI:

@@ -64,7 +64,11 @@ SOURCES:
     run_dt = state.get("run_datetime", "")
     if run_dt:
         try:
-            writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
+            writer = RunReportWriter(
+                ticker=state["ticker"], 
+                run_datetime=run_dt, 
+                company=state.get("company", "")
+            )
             writer.write_final_report(debug_report, report, unique_sources)
             logger.info(f"[Report Generator] 📝 Written final report to {writer.final_path}")
             if valuation:

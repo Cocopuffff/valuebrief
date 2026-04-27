@@ -37,8 +37,12 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
                 run_dt = state.get("run_datetime", "")
                 if run_dt:
                     try:
-                        writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
-                        writer.write_header(company=company)
+                        writer = RunReportWriter(
+                            ticker=state["ticker"], 
+                            run_datetime=run_dt,
+                            company=company
+                        )
+                        writer.write_header()
                         logger.info(f"[Supervisor] 📝 Run artifact initialised: {writer.debug_path}")
                     except Exception as e:
                         logger.warning(f"[Supervisor] ⚠️ Failed to write run header: {e}")
