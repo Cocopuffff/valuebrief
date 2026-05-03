@@ -74,3 +74,6 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.0.5",
     "langchain-google-genai>=4.2.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

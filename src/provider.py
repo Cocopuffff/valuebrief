@@ -2,7 +2,7 @@ import os
 import yfinance as yf
 from typing import List, Optional, Any
 from datetime import date, datetime
-from models import Asset, FinancialMetrics
+from schemas import Asset, FinancialMetrics, SearchResult, NewsResult
 from langchain.tools import tool
 from ddgs import DDGS
 import httpx
@@ -194,38 +194,64 @@ class FinancialDataProvider:
         """Gets latest news within the last 24 hours. Returns up to 10 headlines with titles, URLs, and short snippets. To read the full article content, use scrape_website with the article URL."""
         logger.info(f'Fetching news within last 24 hours for query "{query}"...')
         try:
-            news = list(DDGS().news(
+            raw_news = list(DDGS().news(
                 query,
                 region='us-en',
                 max_results=10,
                 timelimit="d"
             ))
-            logger.info(f'{len(news)} news retrieved')
-            for article in news:
-                logger.debug(f"Title: {article.get('title')}, Link: {article.get('url', article.get('href'))}")
-            return news
         except Exception as e:
             logger.error(f"Error fetching news for {query}: {e}")
             return []
-    
+
+        validated: list[dict[str, Any]] = []
+        for item in raw_news:
+            try:
+                normalized = dict(item)
+                # DDGS news may put the URL in 'url' or 'link'
+                if "url" not in normalized and "link" in normalized:
+                    normalized["url"] = normalized.pop("link")
+                validated.append(
+                    NewsResult.model_validate(normalized).model_dump()
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Provider] Skipping malformed news result for '%s': %s — %s",
+                    query, item.get("title", "?"), e,
+                )
+        logger.info(f'{len(validated)} news retrieved (skipped {len(raw_news) - len(validated)})')
+        return validated
+
     @tool
     @staticmethod
     def search(query: str) -> list[dict[str, Any]]:
         """Search the internet for information. Returns up to 10 results with titles, URLs, and short snippets. To read the full page content, use scrape_website with the page URL."""
         logger.info(f'Searching "{query}"...')
         try:
-            searches = list(DDGS().text(
+            raw_results = list(DDGS().text(
                 query,
                 region='us-en',
                 max_results=10
             ))
-            logger.info(f'{len(searches)} searches retrieved')
-            for article in searches:
-                logger.debug(f"Title: {article.get('title')}, Link: {article.get('href')}")
-            return searches
         except Exception as e:
             logger.error(f"Error searching for {query}: {e}")
             return []
+
+        validated: list[dict[str, Any]] = []
+        for item in raw_results:
+            try:
+                normalized = dict(item)
+                # DDGS text search uses 'href'; SearchResult aliases it to 'url'
+                validated.append(
+                    SearchResult.model_validate(normalized).model_dump()
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Provider] Skipping malformed search result for '%s': %s — %s",
+                    query, item.get("title", "?"), e,
+                )
+        logger.info(f'{len(validated)} searches retrieved (skipped {len(raw_results) - len(validated)})')
+        return validated
 
     @staticmethod
     def _scrape_url(url: str, max_chars: int = 5000) -> str:

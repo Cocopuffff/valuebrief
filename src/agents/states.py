@@ -1,7 +1,6 @@
 from typing import Optional
 from typing_extensions import Annotated, TypedDict
-from provider import Asset
-from models import ValuationModel
+from schemas import Asset, ValuationModel
 import operator
 
 class WorkflowState(TypedDict):
@@ -16,6 +15,11 @@ class WorkflowState(TypedDict):
     judge_decision: str
     valuation: Optional[ValuationModel]
     final_report: str
+    # Hybrid RAG fields
+    citation_manifest: list[dict]      # [{file_path, block_id, resolved_text}]
+    curator_log: str                   # Maintenance actions summary from Curator
+    active_memory_ids: Annotated[list[str], operator.add]  # UUIDs created in this run
+    vault_artifacts: Annotated[list[dict], operator.add]   # Persisted vault metadata
 
 class ResearchState(TypedDict):
     date: str

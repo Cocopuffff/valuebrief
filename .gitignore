@@ -209,3 +209,6 @@ __marimo__/
 # Project specific
 portfolio.json
 logs/runs
+data/vault/
+data/drift_log.json
+.openclaude-profile.json

@@ -28,6 +28,15 @@ class AgentConfig(BaseModel):
     max_iterations: int = 2
     thinking: bool = False  # Enable DeepSeek thinking mode (deepseek-v4-pro etc.)
 
+class CuratorConfig(AgentConfig):
+    """Curator-specific config, extending AgentConfig with maintenance thresholds."""
+    # Fraction of db_limit_mb at which aggressive vector pruning kicks in (0.0–1.0)
+    aggressive_threshold: float = 0.8
+    # Files older than this many days are eligible for LLM synthesis + archival
+    consolidation_cutoff_days: int = 90
+    # Hard storage cap in megabytes (Supabase free tier = 500MB)
+    db_limit_mb: int = 500
+
 class ModelConfig(BaseModel):
     judge: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["JUDGE_PROVIDER"]),
@@ -66,6 +75,15 @@ class ModelConfig(BaseModel):
         model=os.environ["REPORT_GENERATOR_MODEL"],
         temperature=float(os.environ["REPORT_GENERATOR_TEMPERATURE"]),
         thinking=os.environ.get("REPORT_GENERATOR_THINKING", "false").lower() == "true"
+    ))
+    curator: CuratorConfig = Field(default_factory=lambda: CuratorConfig(
+        provider=Provider(os.environ.get("CURATOR_PROVIDER", os.environ["REPORT_GENERATOR_PROVIDER"])),
+        model=os.environ.get("CURATOR_MODEL", os.environ["REPORT_GENERATOR_MODEL"]),
+        temperature=float(os.environ.get("CURATOR_TEMPERATURE", "0.1")),
+        thinking=os.environ.get("CURATOR_THINKING", "false").lower() == "true",
+        aggressive_threshold=float(os.environ.get("CURATOR_AGGRESSIVE_THRESHOLD", "0.8")),
+        consolidation_cutoff_days=int(os.environ.get("CURATOR_CONSOLIDATION_CUTOFF_DAYS", "90")),
+        db_limit_mb=int(os.environ.get("CURATOR_DB_LIMIT_MB", "500")),
     ))
 
 def get_llm(config: AgentConfig):
@@ -109,6 +127,7 @@ class Models:
         self.bear_model = get_llm(self.config.bear)
         self.supervisor_model = get_llm(self.config.supervisor)
         self.report_generator_model = get_llm(self.config.report_generator)
+        self.curator_model = get_llm(self.config.curator)
 
 
 secrets = Secrets()
@@ -119,6 +138,7 @@ supervisor_model = models.supervisor_model
 report_generator_model = models.report_generator_model
 judge_model = models.judge_model
 valuation_model = models.valuation_model
+curator_model = models.curator_model
 
 config = models.config
 

@@ -1,0 +1,311 @@
+"""
+vault.py
+~~~~~~~~
+Local Vault file handler for Hybrid RAG "Cold Storage".
+
+Directory structure:  data/vault/{ticker}/{YYYY-MM-DD}_{source_hash}.md
+
+Each file has:
+- YAML frontmatter (url, source_type, date_scraped, sentiment, block_count, content_hash)
+- Markdown body with unique block IDs appended to each paragraph (^block-XXXX)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import re
+import uuid
+from datetime import date
+from typing import Optional
+
+import yaml
+
+from schemas import VaultDocument
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+VAULT_ROOT = pathlib.Path(
+    os.getenv("VAULT_PATH",
+              pathlib.Path(__file__).parent.parent.parent / "data" / "vault")
+)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _content_hash(text: str) -> str:
+    """SHA-256 of whitespace-normalised content for deduplication."""
+    normalised = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
+
+def _short_uuid() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _tag_blocks(content: str) -> tuple[str, dict[str, str]]:
+    """Split content into paragraphs and append a unique block ID to each.
+
+    Returns the tagged content string and a {block_id: paragraph_text} map.
+    """
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+    tagged_parts: list[str] = []
+    block_map: dict[str, str] = {}
+
+    for para in paragraphs:
+        block_id = f"block-{_short_uuid()}"
+        tagged_parts.append(f"{para} ^{block_id}")
+        block_map[block_id] = para
+
+    return "\n\n".join(tagged_parts), block_map
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Split a Markdown file into YAML frontmatter dict and body content."""
+    if not text.startswith("---"):
+        return {}, text
+
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        fm = {}
+
+    body = parts[2].strip()
+    return fm, body
+
+
+def _extract_block_map(body: str) -> dict[str, str]:
+    """Parse block IDs from tagged content.
+
+    Block IDs look like: ... ^block-abcd1234
+    """
+    block_map: dict[str, str] = {}
+    pattern = re.compile(r"\^(block-[a-f0-9]{8})")
+
+    for paragraph in body.split("\n\n"):
+        match = pattern.search(paragraph)
+        if match:
+            block_id = match.group(1)
+            # Remove the block ID tag to get clean paragraph text
+            clean = pattern.sub("", paragraph).strip()
+            block_map[block_id] = clean
+
+    return block_map
+
+
+# ── VaultWriter ──────────────────────────────────────────────────────────────
+
+class VaultWriter:
+    """Writes research documents to the local vault."""
+
+    def __init__(self, root: Optional[pathlib.Path] = None) -> None:
+        self.root = root or VAULT_ROOT
+
+    def write_document(
+        self,
+        ticker: str,
+        content: str,
+        metadata: Optional[dict] = None,
+    ) -> pathlib.Path:
+        """Write a Markdown document to the vault.
+
+        Args:
+            ticker:   Stock ticker (e.g. 'AAPL').
+            content:  Raw Markdown content to store.
+            metadata: Dict with optional keys: url, source_type, sentiment.
+
+        Returns:
+            The Path of the created file.
+        """
+        metadata = metadata or {}
+        ticker = ticker.upper()
+        today = date.today().isoformat()
+        c_hash = _content_hash(content)
+
+        # Build directory
+        ticker_dir = self.root / ticker
+        ticker_dir.mkdir(parents=True, exist_ok=True)
+
+        # Tag paragraphs with block IDs
+        tagged_content, block_map = _tag_blocks(content)
+
+        # Build YAML frontmatter
+        frontmatter = {
+            "url": metadata.get("url", ""),
+            "source_type": metadata.get("source_type", "analysis"),
+            "date_scraped": today,
+            "sentiment": metadata.get("sentiment"),
+            "block_count": len(block_map),
+            "content_hash": c_hash,
+            "archived": False,
+        }
+        frontmatter.update(
+            {
+                key: value
+                for key, value in metadata.items()
+                if key not in frontmatter and value is not None
+            }
+        )
+
+        # Compose final file content
+        fm_str = yaml.dump(frontmatter, default_flow_style=False, sort_keys=False)
+        file_content = f"---\n{fm_str}---\n\n{tagged_content}\n"
+
+        # Filename: YYYY-MM-DD_<hash>.md
+        filename = f"{today}_{c_hash}.md"
+        file_path = ticker_dir / filename
+
+        # Skip if identical content already exists
+        if file_path.exists():
+            logger.debug(f"[Vault] Skipping duplicate: {file_path}")
+            return file_path
+
+        file_path.write_text(file_content, encoding="utf-8")
+        logger.info(f"[Vault] 📁 Written: {file_path} ({len(block_map)} blocks)")
+        return file_path
+
+    def write_synthesis(
+        self,
+        ticker: str,
+        month: str,
+        content: str,
+        metadata: Optional[dict] = None,
+    ) -> pathlib.Path:
+        """Write or overwrite a monthly synthesis file.
+
+        Unlike ``write_document``, this uses a predictable filename
+        (``{month}_synthesis.md``) so it can be found and updated
+        incrementally across daily runs.
+
+        Args:
+            ticker:   Stock ticker.
+            month:    Month string, e.g. ``"2026-01"``.
+            content:  The LLM-synthesised Markdown content.
+            metadata: Optional extra frontmatter fields.
+
+        Returns:
+            The Path of the created/overwritten file.
+        """
+        metadata = metadata or {}
+        ticker = ticker.upper()
+        c_hash = _content_hash(content)
+
+        ticker_dir = self.root / ticker
+        ticker_dir.mkdir(parents=True, exist_ok=True)
+
+        tagged_content, block_map = _tag_blocks(content)
+
+        frontmatter = {
+            "url": metadata.get("url", ""),
+            "source_type": "monthly_synthesis",
+            "date_scraped": date.today().isoformat(),
+            "sentiment": metadata.get("sentiment"),
+            "block_count": len(block_map),
+            "content_hash": c_hash,
+            "month": month,
+            "archived": False,
+        }
+        frontmatter.update(
+            {
+                key: value
+                for key, value in metadata.items()
+                if key not in frontmatter and value is not None
+            }
+        )
+
+        fm_str = yaml.dump(frontmatter, default_flow_style=False, sort_keys=False)
+        file_content = f"---\n{fm_str}---\n\n{tagged_content}\n"
+
+        file_path = ticker_dir / f"{month}_synthesis.md"
+        file_path.write_text(file_content, encoding="utf-8")
+        logger.info(f"[Vault] 📁 Synthesis written: {file_path} ({len(block_map)} blocks)")
+        return file_path
+
+
+# ── VaultReader ──────────────────────────────────────────────────────────────
+
+class VaultReader:
+    """Reads and queries documents from the local vault."""
+
+    def __init__(self, root: Optional[pathlib.Path] = None) -> None:
+        self.root = root or VAULT_ROOT
+
+    def read_document(self, path: str | pathlib.Path) -> VaultDocument:
+        """Parse a vault Markdown file into a VaultDocument."""
+        path = pathlib.Path(path)
+        text = path.read_text(encoding="utf-8")
+        fm, body = _parse_frontmatter(text)
+        block_map = _extract_block_map(body)
+
+        # Derive ticker from parent directory name
+        ticker = path.parent.name
+
+        return VaultDocument(
+            path=str(path),
+            ticker=ticker.upper(),
+            url=fm.get("url"),
+            source_type=fm.get("source_type", "analysis"),
+            date_scraped=fm.get("date_scraped", ""),
+            sentiment=fm.get("sentiment"),
+            content=body,
+            block_map=block_map,
+            content_hash=fm.get("content_hash", ""),
+            archived=fm.get("archived", False),
+        )
+
+    def list_documents(
+        self,
+        ticker: str,
+        since: Optional[str] = None,
+    ) -> list[VaultDocument]:
+        """List all vault documents for a ticker, optionally filtered by date.
+
+        Args:
+            ticker: Stock ticker symbol.
+            since:  ISO date string (YYYY-MM-DD). Only return files on or after this date.
+        """
+        ticker = ticker.upper()
+        ticker_dir = self.root / ticker
+        if not ticker_dir.exists():
+            return []
+
+        docs: list[VaultDocument] = []
+        for md_file in sorted(ticker_dir.glob("*.md")):
+            if since:
+                # Filename starts with YYYY-MM-DD
+                file_date = md_file.stem[:10]
+                if file_date < since:
+                    continue
+            try:
+                docs.append(self.read_document(md_file))
+            except Exception as e:
+                logger.warning(f"[Vault] Failed to parse {md_file}: {e}")
+
+        return docs
+
+    def resolve_block(self, path: str | pathlib.Path, block_id: str) -> Optional[str]:
+        """Return the paragraph text for a given block ID in a vault file."""
+        doc = self.read_document(path)
+        return doc.block_map.get(block_id)
+
+    def get_block_map(self, path: str | pathlib.Path) -> dict[str, str]:
+        """Return the full {block_id: paragraph_text} map for a vault file."""
+        doc = self.read_document(path)
+        return doc.block_map
+
+    def mark_archived(self, path: str | pathlib.Path) -> None:
+        """Update the YAML frontmatter to set archived=true."""
+        path = pathlib.Path(path)
+        text = path.read_text(encoding="utf-8")
+        fm, body = _parse_frontmatter(text)
+        fm["archived"] = True
+
+        fm_str = yaml.dump(fm, default_flow_style=False, sort_keys=False)
+        path.write_text(f"---\n{fm_str}---\n\n{body}\n", encoding="utf-8")
+        logger.info(f"[Vault] 📦 Archived: {path}")

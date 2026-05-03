@@ -10,9 +10,11 @@ from agents.supervisor import supervisor
 from agents.analysts import bull_analyst, bear_analyst, research_tool_node
 from agents.judge import judge_analyst
 from agents.report_generator import report_generator
-from models import AgentNode
+from agents.curator import curator_agent
+from schemas import AgentNode
 from utils.logger import get_logger
 from utils.report_writer import RunReportWriter
+from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
 from utils.config import config
 
 logger = get_logger(__name__)
@@ -84,13 +86,36 @@ async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         "messages": [],
     }
     result = await bull_subgraph.ainvoke(research_input)
-    update = {"bull_thesis": result["thesis"], "sources": state["sources"] + result["sources"]}
+    update = {"bull_thesis": result["thesis"], "sources": result["sources"]}
+
+    try:
+        artifact = await persist_research_artifact(
+            ticker=state["ticker"],
+            content=result["thesis"],
+            source_type="bull_thesis",
+            source_priority=1,
+            metadata={
+                "agent": "bull",
+                "company": state.get("company", ""),
+                "run_datetime": state.get("run_datetime", ""),
+                "source_urls": sorted(set(result.get("sources", []))),
+            },
+        )
+        if artifact.path:
+            update["vault_artifacts"] = [artifact.model_dump(mode="json")]
+            update["active_memory_ids"] = memory_ids_from_artifact(artifact)
+    except Exception as e:
+        logger.warning(f"[Bull Research] ⚠️ Failed to persist bull thesis: {e}")
 
     # Persist bull thesis to run artifact
     run_dt = state.get("run_datetime", "")
     if run_dt:
         try:
-            writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
+            writer = RunReportWriter(
+                ticker=state["ticker"],
+                run_datetime=run_dt,
+                company=state.get("company", ""),
+            )
             writer.write_bull_thesis(result["thesis"])
             logger.info(f"[Bull Research] 📝 Written bull thesis to {writer.debug_path}")
         except Exception as e:
@@ -114,13 +139,36 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         "messages": [],
     }
     result = await bear_subgraph.ainvoke(research_input)
-    update = {"bear_thesis": result["thesis"], "sources": state["sources"] + result["sources"]}
+    update = {"bear_thesis": result["thesis"], "sources": result["sources"]}
+
+    try:
+        artifact = await persist_research_artifact(
+            ticker=state["ticker"],
+            content=result["thesis"],
+            source_type="bear_thesis",
+            source_priority=1,
+            metadata={
+                "agent": "bear",
+                "company": state.get("company", ""),
+                "run_datetime": state.get("run_datetime", ""),
+                "source_urls": sorted(set(result.get("sources", []))),
+            },
+        )
+        if artifact.path:
+            update["vault_artifacts"] = [artifact.model_dump(mode="json")]
+            update["active_memory_ids"] = memory_ids_from_artifact(artifact)
+    except Exception as e:
+        logger.warning(f"[Bear Research] ⚠️ Failed to persist bear thesis: {e}")
 
     # Persist bear thesis to run artifact
     run_dt = state.get("run_datetime", "")
     if run_dt:
         try:
-            writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
+            writer = RunReportWriter(
+                ticker=state["ticker"],
+                run_datetime=run_dt,
+                company=state.get("company", ""),
+            )
             writer.write_bear_thesis(result["thesis"])
             logger.info(f"[Bear Research] 📝 Written bear thesis to {writer.debug_path}")
         except Exception as e:
@@ -142,9 +190,11 @@ def build_research_workflow(checkpointer: AsyncPostgresSaver):
         .add_node("bear_research", run_bear_research)
         .add_node(AgentNode.JUDGE, judge_analyst)
         .add_node(AgentNode.REPORT_GENERATOR, report_generator)
+        .add_node(AgentNode.CURATOR, curator_agent)
         .add_edge(START, AgentNode.SUPERVISOR)
         # Supervisor uses Command(goto=...) for dynamic routing — no conditional edges needed
         # Judge routes directly to report_generator via Command
-        .add_edge(AgentNode.REPORT_GENERATOR, END)
+        .add_edge(AgentNode.REPORT_GENERATOR, AgentNode.CURATOR)
+        .add_edge(AgentNode.CURATOR, END)
         .compile(checkpointer=checkpointer, store=store)
     )

@@ -2,9 +2,9 @@ import json
 from langchain.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
 from typing import Any, Literal
 
-from models import AgentNode, ValuationModel
-from agents.states import ResearchState
+from schemas import AgentNode, ValuationModel
 from provider import FinancialDataProvider
+from agents.states import ResearchState
 from utils.logger import get_logger, log_node_execution
 from utils.config import bull_model, bear_model
 

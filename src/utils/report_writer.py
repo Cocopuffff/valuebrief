@@ -48,7 +48,7 @@ class RunReportWriter:
         writer.write_final_report(report_text, sources)
     """
 
-    def __init__(self, ticker: str, company: str, run_datetime: str) -> None:
+    def __init__(self, ticker: str, company: str = "", run_datetime: str = "") -> None:
         """
         Args:
             ticker:       Stock ticker symbol, e.g. 'ABCD'.

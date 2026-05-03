@@ -3,9 +3,10 @@ from langchain.messages import SystemMessage, HumanMessage
 from langgraph.types import Command
 from typing import Literal
 from agents.states import WorkflowState
-from models import ValuationModel, AgentNode
+from schemas import ValuationModel, AgentNode
 from utils.logger import get_logger, log_node_execution
 from utils.report_writer import RunReportWriter
+from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
 from utils.config import judge_model, valuation_model
 
 logger = get_logger(__name__)
@@ -464,11 +465,41 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         valuation.valuation_data = valuation.model_dump(mode="json")
 
     # ── Persist judge output to run artifact ────────────────────────────
+    dcf_md = _build_dcf_summary(valuation)
+    judge_content = (
+        f"# {state['company']} ({state['ticker']}) Judge Analysis\n\n"
+        f"## Qualitative Synthesis\n\n"
+        f"{initial_synthesis if isinstance(initial_synthesis, str) else str(initial_synthesis)}\n\n"
+        f"## DCF Valuation\n\n"
+        f"{dcf_md}\n\n"
+        f"## Final Decision\n\n"
+        f"{final_decision if isinstance(final_decision, str) else str(final_decision)}"
+    )
+    artifact: dict = {}
+    try:
+        artifact = await persist_research_artifact(
+            ticker=state["ticker"],
+            content=judge_content,
+            source_type="judge_analysis",
+            source_priority=2,
+            metadata={
+                "agent": "judge",
+                "company": state.get("company", ""),
+                "run_datetime": state.get("run_datetime", ""),
+                "recommendation": valuation.recommendation if valuation else None,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"[Judge] ⚠️ Failed to persist judge analysis: {e}")
+
     run_dt = state.get("run_datetime", "")
     if run_dt:
         try:
-            writer = RunReportWriter(ticker=state["ticker"], run_datetime=run_dt)
-            dcf_md = _build_dcf_summary(valuation)
+            writer = RunReportWriter(
+                ticker=state["ticker"],
+                run_datetime=run_dt,
+                company=state.get("company", ""),
+            )
             writer.write_judge_output(
                 synthesis=initial_synthesis if isinstance(initial_synthesis, str) else str(initial_synthesis),
                 valuation_md=dcf_md,
@@ -478,7 +509,12 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         except Exception as e:
             logger.warning(f"[Judge] ⚠️ Failed to write judge output: {e}")
 
+    update = {"judge_decision": final_decision, "valuation": valuation, "thesis_data": initial_synthesis}
+    if artifact.path:
+        update["vault_artifacts"] = [artifact.model_dump(mode="json")]
+        update["active_memory_ids"] = memory_ids_from_artifact(artifact)
+
     return Command(
-        update={"judge_decision": final_decision, "valuation": valuation, "thesis_data": initial_synthesis},
+        update=update,
         goto=AgentNode.REPORT_GENERATOR,
     )

@@ -1,10 +1,11 @@
 from langgraph.types import Command
 from typing import Literal
 from agents.states import WorkflowState
-from models import AgentNode
-from provider import *
+from schemas import AgentNode
+from provider import DateTimeProvider, FinancialDataProvider
 from utils.logger import get_logger, log_node_execution
 from utils.report_writer import RunReportWriter
+from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
 from utils.config import supervisor_model
 
 logger = get_logger(__name__)
@@ -12,6 +13,32 @@ logger = get_logger(__name__)
 tools = [DateTimeProvider.get_current_date, FinancialDataProvider.get_asset_data, FinancialDataProvider.get_multiple_assets]
 tools_by_name = {tool.name: tool for tool in tools}
 supervisor_model_with_tools = supervisor_model.bind_tools(tools)
+
+
+def _build_fundamentals_md(asset) -> str:
+    """Build a Markdown summary of an Asset's fundamentals for vault storage."""
+    f = asset.fundamentals
+    lines = [
+        f"# {asset.name or asset.ticker} — Fundamentals Snapshot",
+        "",
+        f"**Ticker:** {asset.ticker}",
+        f"**Current Price:** ${asset.current_price:,.2f}" if asset.current_price else None,
+        f"**Shares Outstanding:** {asset.shares_outstanding/1e6:,.1f}M" if asset.shares_outstanding else None,
+        f"**Market Cap:** ${f.market_cap/1e6:,.1f}M" if f.market_cap else None,
+        f"**Total Revenue (TTM):** ${f.total_revenue/1e6:,.1f}M" if f.total_revenue else None,
+        f"**Revenue Growth (YoY):** {f.revenue_growth:.1%}" if f.revenue_growth is not None else None,
+        f"**EBITDA Margin:** {f.ebitda_margin:.1%}" if f.ebitda_margin is not None else None,
+        f"**Free Cash Flow:** ${f.free_cash_flow/1e6:,.1f}M" if f.free_cash_flow else None,
+        f"**Trailing P/E:** {f.pe_ratio:.1f}" if f.pe_ratio else None,
+        f"**Forward P/E:** {f.forward_pe_ratio:.1f}" if f.forward_pe_ratio else None,
+        f"**PEG Ratio:** {f.peg_ratio:.2f}" if f.peg_ratio else None,
+        f"**Debt/Equity:** {f.debt_to_equity:.1f}" if f.debt_to_equity else None,
+        f"**ROE:** {f.return_on_equity:.1%}" if f.return_on_equity is not None else None,
+        f"**Sector:** {asset.sector}" if asset.sector else None,
+        f"**Industry:** {asset.industry}" if asset.industry else None,
+    ]
+    return "\n".join(line for line in lines if line is not None)
+
 
 @log_node_execution
 async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_research", "bear_research", "__end__"]]:
@@ -46,6 +73,27 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
                         logger.info(f"[Supervisor] 📝 Run artifact initialised: {writer.debug_path}")
                     except Exception as e:
                         logger.warning(f"[Supervisor] ⚠️ Failed to write run header: {e}")
+
+            # Save fundamentals to the local vault
+            try:
+                fundamentals_md = _build_fundamentals_md(asset)
+                artifact = await persist_research_artifact(
+                    ticker=state["ticker"],
+                    content=fundamentals_md,
+                    source_type="fundamentals",
+                    source_priority=2,
+                    metadata={
+                        "url": "alphavantage+yfinance",
+                        "sentiment": "neutral",
+                        "company": asset.name or state["ticker"],
+                        "run_datetime": state.get("run_datetime", ""),
+                    },
+                )
+                if artifact.path:
+                    updates["vault_artifacts"] = [artifact.model_dump(mode="json")]
+                    updates["active_memory_ids"] = memory_ids_from_artifact(artifact)
+            except Exception as e:
+                logger.warning(f"[Supervisor] ⚠️ Failed to write vault entry: {e}")
     
     bull_done = state.get('bull_thesis')
     bear_done = state.get('bear_thesis')

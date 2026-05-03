@@ -2,7 +2,7 @@ from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from typing import Optional, Any
-from models import ValuationModel
+from schemas import ValuationModel
 from utils.config import secrets
 from utils.logger import get_logger
 
@@ -66,6 +66,6 @@ async def get_valuation(ticker: str) -> Optional[ValuationModel]:
             val_data = row.get("valuation_data", {})
             if "scenarios" in val_data:
                 row["scenarios"] = val_data["scenarios"]
-                
+
             return ValuationModel(**row)
             

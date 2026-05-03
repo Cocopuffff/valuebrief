@@ -2,16 +2,23 @@ from typing import Literal
 from langgraph.types import Command
 from agents.states import WorkflowState
 from agents.judge import _build_dcf_summary
+from schemas import AgentNode
 
 from utils.logger import log_node_execution, logging
 from utils.db import upsert_valuation
 from utils.report_writer import RunReportWriter
+from utils.citations import build_citation_manifest
+from utils.research_persistence import (
+    format_artifact_citations,
+    memory_ids_from_artifact,
+    persist_research_artifact,
+)
 import json
 
 logger = logging.getLogger(__name__)
 
 @log_node_execution
-async def report_generator(state: WorkflowState) -> Command[Literal["__end__"]]:
+async def report_generator(state: WorkflowState) -> Command[Literal[AgentNode.CURATOR]]:
     """Generate the final investment report including valuation results."""
     logger.info(f"Generating final report for {state['company']}...")
 
@@ -32,6 +39,38 @@ DCF VALUATION
     unique_sources = sorted(list(set(state.get("sources", []))))
     sources_formatted = "\n".join(f"- {s}" for s in unique_sources) if unique_sources else "N/A"
 
+    report = f"""
+INVESTMENT THESIS:
+{state.get('judge_decision', 'N/A')}
+{valuation_section}
+
+SOURCES:
+{sources_formatted}
+"""
+    report_artifact: dict = {}
+    report_artifacts = list(state.get("vault_artifacts", []))
+    try:
+        report_artifact = await persist_research_artifact(
+            ticker=state["ticker"],
+            content=report,
+            source_type="final_report",
+            source_priority=2,
+            metadata={
+                "agent": "report_generator",
+                "company": state.get("company", ""),
+                "run_datetime": state.get("run_datetime", ""),
+                "source_urls": unique_sources,
+            },
+        )
+        if report_artifact.path:
+            report_artifacts.append(report_artifact)
+    except Exception as e:
+        logger.warning(f"[Report Generator] ⚠️ Failed to persist final report: {e}")
+
+    vault_citations = format_artifact_citations(report_artifacts)
+    if vault_citations:
+        report = f"{report}\nVAULT CITATIONS:\n{vault_citations}\n"
+
     debug_report = f"""
 DEBUG REPORT: {state['company']} ({state['ticker']})
 
@@ -48,17 +87,11 @@ JUDGE DECISION:
 SOURCES:
 {sources_formatted}
 
+VAULT CITATIONS:
+{vault_citations or 'N/A'}
+
 WORKFLOW_STATE:
 {json.dumps(state, indent=2, default=str)}
-"""
-
-    report = f"""
-INVESTMENT THESIS:
-{state.get('judge_decision', 'N/A')}
-{valuation_section}
-
-SOURCES:
-{sources_formatted}
 """
     # Persist final report to run artifact
     run_dt = state.get("run_datetime", "")
@@ -81,4 +114,15 @@ SOURCES:
         except Exception as e:
             logger.warning(f"[Report Generator] ⚠️ Failed to write final report: {e}")
 
-    return Command(update={"final_report": report}, goto="__end__")
+    # Build citation manifest for the Curator
+    manifest = [
+        {"file_path": c.file_path, "block_id": c.block_id, "resolved_text": c.resolved_text}
+        for c in build_citation_manifest(report, state["ticker"])
+    ]
+
+    update = {"final_report": report, "citation_manifest": manifest}
+    if getattr(report_artifact, "path", False):
+        update["vault_artifacts"] = [report_artifact.model_dump(mode="json")]
+        update["active_memory_ids"] = memory_ids_from_artifact(report_artifact)
+
+    return Command(update=update, goto=AgentNode.CURATOR)

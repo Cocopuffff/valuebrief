@@ -15,12 +15,14 @@ from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 from utils.config import secrets
 from utils.db import get_valuation
+from schemas.base import validate_tickers
 
 # Initialize logger
 setup_logging()
 logger = get_logger(__name__)
 
 DB_URI = secrets.SUPABASE_URI
+
 
 async def main():
     parser = argparse.ArgumentParser(description="Value Brief: Automated Daily Digest for Portfolio Tracking")
@@ -30,20 +32,30 @@ async def main():
     args = parser.parse_args()
 
     # Load tickers from JSON or arguments
-    tickers = []
+    raw_tickers: list[str] = []
     if args.tickers:
-        tickers = args.tickers
+        raw_tickers = args.tickers
     else:
         try:
             with open(args.portfolio, "r") as f:
                 data = json.load(f)
-                tickers = data.get("tickers", [])
+                raw_tickers = data.get("tickers", [])
         except FileNotFoundError:
             logger.error(f"{args.portfolio} not found. Please provide tickers via --tickers or create portfolio.json.")
             return
 
-    if not tickers:
+    if not isinstance(raw_tickers, list):
+        logger.error("Portfolio 'tickers' must be a list.")
+        return
+
+    if not raw_tickers:
         logger.warning("No tickers to track.")
+        return
+
+    try:
+        tickers = validate_tickers(raw_tickers)
+    except ValueError as e:
+        logger.error(str(e))
         return
 
 
@@ -85,6 +97,11 @@ async def main():
                     "judge_decision": "",
                     "valuation": existing_valuation,
                     "final_report": "",
+                    # Hybrid RAG fields
+                    "citation_manifest": [],
+                    "curator_log": "",
+                    "active_memory_ids": [],
+                    "vault_artifacts": [],
                 }
 
                 async for event in workflow.astream_log(state, config, include_types=["llm", "tool"]):
