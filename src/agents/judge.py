@@ -1,4 +1,5 @@
 import json
+import re
 from langchain.messages import SystemMessage, HumanMessage
 from langgraph.types import Command
 from typing import Literal
@@ -88,20 +89,51 @@ investment update. You must accumulate, prune, and evolve the investment thesis 
 You will receive:
 1. **Prior Investment Thesis**: Your final decision from the previous update (if any). \
 This is your FOUNDATION.
-2. **New Qualitative Synthesis**: A summary of today's bull and bear arguments.
-3. **New DCF Valuation Results**: The updated quantitative realities.
+2. **Prior Thesis Pillars**: Active investment pillars from the previous run \
+(if any). Each pillar has a prior_ref, pillar_id, memory_id, version, statement, current status, and dossier citation.
+3. **New Qualitative Synthesis**: A summary of today's bull and bear arguments.
+4. **New DCF Valuation Results**: The updated quantitative realities.
 
 Your job is to produce an UPDATED investment thesis that reconciles any tension \
-between the qualitative sentiment and the quantitative reality. Do NOT just summarize the DCF math! \
-Instead, integrate the previous thesis with today's new facts. Prune stale information \
-and accumulate new insights.
+between the qualitative sentiment and the quantitative reality.
 
-Structure your response as:
-1. **Verdict** — one sentence (e.g. "Buy on weakness" / "Hold" / "Avoid").
-2. **Rationale** — 2-3 paragraphs integrating the prior ongoing thesis with the new qualitative and quantitative insights. Focus on business fundamentals and valuation multiples, NOT specific year-by-year math.
-3. **Key Risks** — bullet list of the most important risks to your thesis.
+Structure your response in TWO sections separated by the delimiter ``----JSON----``:
 
-Do NOT call any tools. Respond with plain text only.\
+**Section 1 — Investment Thesis (plain text):**
+1. **Verdict** — one sentence.
+2. **Rationale** — 2-3 paragraphs integrating prior thesis with new insights.
+3. **Key Risks** — bullet list.
+
+**Section 2 — Thesis Pillars & Outcomes (JSON after the delimiter):**
+Produce a JSON object with two keys:
+
+- ``thesis_pillars``: Array of current thesis pillar candidates derived from the reconciled \
+investment thesis. Each pillar must have:
+  * ``candidate_ref``: stable local reference you create in this response (e.g. "C1")
+  * ``matched_prior_ref``: prior_ref if this candidate is the same/revised prior pillar, empty string if new
+  * ``matched_pillar_id``: prior pillar_id if this candidate is the same/revised prior pillar, empty string if new
+  * ``pillar_type``: one of "moat", "growth", "risk", "valuation_assumption", "capital_allocation", "thesis_change"
+  * ``statement``: the core claim (1-2 sentences)
+  * ``rationale``: supporting evidence (1-3 sentences)
+  * ``valuation_impact``: how this affects intrinsic value (1 sentence)
+  * ``source_urls``: list of URLs from analyst research that support this pillar
+  * ``evidence_citations``: list of vault block citations (e.g. "file.md#^blockid")
+  * ``resurrection_reason``: required only if reviving a previously contradicted/stale/superseded idea
+  * ``status``: "supported" or "weakened" for current active pillars
+
+Do not create stable pillar IDs for new pillars. The system assigns them deterministically.
+
+- ``pillar_outcomes``: Array evaluating each prior pillar you received. Each outcome must have:
+  * ``memory_id``: the UUID of the prior pillar memory
+  * ``pillar_id``: matches the prior pillar's pillar_id
+  * ``status``: "supported" | "weakened" | "revised" | "contradicted" | "stale"
+  * ``reason``: why this status was assigned (1-2 sentences)
+  * ``replacement_statement``: if "revised", the new statement (empty string otherwise)
+  * ``source_urls``: list of URLs that support the evaluation
+
+- ``valuation_impact`` (optional): brief summary of how the DCF results inform the thesis.
+
+CRITICAL: The JSON must be valid. Do NOT wrap it in markdown fences after the delimiter.\
 """
 
 
@@ -431,28 +463,41 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         company=state["company"],
         ticker=state["ticker"],
     )
-    
+
     prior_thesis = "No prior thesis available. This is the initial analysis."
     prior_valuation = state.get("valuation")
     if prior_valuation and prior_valuation.thesis_data:
         prior_thesis = prior_valuation.thesis_data.get("final_decision", prior_thesis)
-        
+
+    # Build prior pillars context from rag_context and retrieved_memory_ids
+    prior_pillars_context = _build_prior_pillars_context(state)
+
     dcf_summary_for_judge = _build_dcf_summary_for_judge(valuation)
-    
+
     reconcile_messages = [
         SystemMessage(content=reconcile_prompt),
         HumanMessage(
             content=(
                 f"## Prior Investment Thesis\n{prior_thesis}\n\n"
+                f"{prior_pillars_context}\n\n"
                 f"## New Qualitative Synthesis\n{initial_synthesis}\n\n"
                 f"## New DCF Valuation Results\n{dcf_summary_for_judge}"
             )
         ),
     ]
     reconcile_response = await judge_model.ainvoke(reconcile_messages)
-    final_decision = reconcile_response.content
+    reconcile_raw = reconcile_response.content if isinstance(reconcile_response.content, str) else str(reconcile_response.content)
     logger.info("[Judge] ✅ Reconciliation complete")
-    logger.debug(f"[Judge] Final decision snippet: {final_decision[:200]}...")
+    logger.debug(f"[Judge] Reconcile snippet: {reconcile_raw[:200]}...")
+
+    # ── Parse thesis pillars and pillar outcomes from reconcile response ─
+    final_decision, thesis_pillars, pillar_outcomes = _parse_reconcile_output(
+        reconcile_raw, state
+    )
+    logger.info(
+        "[Judge] Extracted %d thesis pillars, %d pillar outcomes",
+        len(thesis_pillars), len(pillar_outcomes),
+    )
 
     # Save our synthesized elements into the JSONB payloads for the database NOW
     if valuation is not None:
@@ -460,7 +505,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
             "synthesis": initial_synthesis,
             "bull": state.get("bull_thesis") or "",
             "bear": state.get("bear_thesis") or "",
-            "final_decision": final_decision if isinstance(final_decision, str) else str(final_decision)
+            "final_decision": final_decision if isinstance(final_decision, str) else str(final_decision),
         }
         valuation.valuation_data = valuation.model_dump(mode="json")
 
@@ -482,6 +527,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
             content=judge_content,
             source_type="judge_analysis",
             source_priority=2,
+            vectorize=False,
             metadata={
                 "agent": "judge",
                 "company": state.get("company", ""),
@@ -509,12 +555,144 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         except Exception as e:
             logger.warning(f"[Judge] ⚠️ Failed to write judge output: {e}")
 
-    update = {"judge_decision": final_decision, "valuation": valuation, "thesis_data": initial_synthesis}
+    update = {
+        "judge_decision": final_decision,
+        "valuation": valuation,
+        "thesis_data": initial_synthesis,
+        "thesis_pillars": [p.model_dump(mode="json") for p in thesis_pillars],
+        "pillar_outcomes": [o.model_dump(mode="json") for o in pillar_outcomes],
+    }
     if artifact.path:
         update["vault_artifacts"] = [artifact.model_dump(mode="json")]
-        update["active_memory_ids"] = memory_ids_from_artifact(artifact)
 
     return Command(
         update=update,
         goto=AgentNode.REPORT_GENERATOR,
     )
+
+
+# ── Prior pillars context builder ────────────────────────────────────────────
+
+
+def _build_prior_pillars_context(state: WorkflowState) -> str:
+    """Build a Markdown summary of prior active pillars for the reconcile prompt.
+
+    Uses ``rag_context`` and ``retrieved_memory_ids`` from state to identify
+    which pillars were retrieved and pass them with their UUIDs.
+    """
+    retrieved_ids = state.get("retrieved_memory_ids", [])
+    if not retrieved_ids:
+        return "## Prior Thesis Pillars\nNo prior pillars available."
+
+    rag_context = state.get("rag_context", "")
+    if rag_context:
+        return f"## Prior Thesis Pillars\n{rag_context}"
+
+    return f"## Prior Thesis Pillars\n{len(retrieved_ids)} prior pillar memory IDs retrieved."
+
+
+# ── Reconcile output parsing ─────────────────────────────────────────────────
+
+_JSON_DELIMITER = "----JSON----"
+
+
+def _parse_reconcile_output(
+    raw: str,
+    state: WorkflowState,
+) -> tuple[str, list, list]:
+    """Parse the judge's reconcile output into decision text + structured pillars.
+
+    Splits on ``----JSON----`` delimiter.  The text portion becomes
+    ``final_decision``.  The JSON portion is parsed into ``ThesisPillar`` and
+    ``PillarOutcome`` lists.
+
+    Falls back gracefully: if no delimiter is found, the entire response becomes
+    the decision with empty pillars/outcomes.
+    """
+    from schemas.rag import ThesisPillar, PillarOutcome
+
+    retrieved_ids = state.get("retrieved_memory_ids", [])
+
+    if _JSON_DELIMITER not in raw:
+        logger.warning("[Judge] No pillar JSON delimiter found in reconcile output")
+        return raw, [], []
+
+    text_part, json_part = raw.split(_JSON_DELIMITER, 1)
+    final_decision = text_part.strip()
+
+    # ── Parse JSON ──────────────────────────────────────────────────────
+    json_text = json_part.strip()
+    # Strip markdown fences if present
+    if json_text.startswith("```"):
+        first_nl = json_text.index("\n") if "\n" in json_text else 3
+        json_text = json_text[first_nl:].strip()
+    if json_text.endswith("```"):
+        json_text = json_text[:-3].strip()
+
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.warning("[Judge] Failed to parse pillar JSON: %s", e)
+        return final_decision, [], []
+
+    thesis_pillars: list[ThesisPillar] = []
+    pillar_outcomes: list[PillarOutcome] = []
+
+    # Parse thesis_pillars
+    for raw_pillar in data.get("thesis_pillars", []):
+        try:
+            matched_pillar_id = str(raw_pillar.get("matched_pillar_id", "") or "")
+            if not matched_pillar_id and raw_pillar.get("matched_prior_ref"):
+                matched_pillar_id = str(raw_pillar.get("pillar_id", "") or "")
+            raw_status = str(raw_pillar.get("status", "supported")).strip().lower()
+            pillar_status = "weakened" if raw_status == "weakened" else "supported"
+            thesis_pillars.append(ThesisPillar(
+                pillar_id=matched_pillar_id,
+                candidate_ref=str(raw_pillar.get("candidate_ref", "")),
+                matched_prior_ref=str(raw_pillar.get("matched_prior_ref", "")),
+                matched_pillar_id=matched_pillar_id,
+                pillar_type=raw_pillar.get("pillar_type", "growth"),
+                statement=str(raw_pillar.get("statement", "")),
+                rationale=str(raw_pillar.get("rationale", "")),
+                valuation_impact=str(raw_pillar.get("valuation_impact", "")),
+                source_urls=list(raw_pillar.get("source_urls", [])),
+                evidence_citations=list(raw_pillar.get("evidence_citations", [])),
+                resurrection_reason=str(raw_pillar.get("resurrection_reason", "")),
+                status=pillar_status,
+            ))
+        except Exception as e:
+            logger.warning("[Judge] Skipping malformed thesis pillar: %s", e)
+
+    # Parse pillar_outcomes
+    for raw_outcome in data.get("pillar_outcomes", []):
+        try:
+            memory_id = str(raw_outcome.get("memory_id", ""))
+            pillar_id = str(raw_outcome.get("pillar_id", ""))
+            status = str(raw_outcome.get("status", "supported")).strip().lower()
+            if status == "updated":
+                status = "revised"
+
+            # Validate memory_id is in retrieved_ids (security: don't trust LLM to invent UUIDs)
+            if memory_id and retrieved_ids and memory_id not in retrieved_ids:
+                logger.warning(
+                    "[Judge] Pillar outcome memory_id %s not in retrieved_ids, skipping",
+                    memory_id[:8],
+                )
+                continue
+
+            pillar_outcomes.append(PillarOutcome(
+                memory_id=memory_id,
+                pillar_id=pillar_id,
+                status=status,
+                reason=str(raw_outcome.get("reason", "")),
+                replacement_statement=str(raw_outcome.get("replacement_statement", "")),
+                source_urls=list(raw_outcome.get("source_urls", [])),
+            ))
+        except Exception as e:
+            logger.warning("[Judge] Skipping malformed pillar outcome: %s", e)
+
+    logger.info(
+        "[Judge] Parsed %d pillars + %d outcomes from reconcile JSON",
+        len(thesis_pillars), len(pillar_outcomes),
+    )
+    return final_decision, thesis_pillars, pillar_outcomes

@@ -39,7 +39,7 @@ class ChatDeepSeekThinking(ChatDeepSeek):
         llm = ChatDeepSeekThinking(
             model="deepseek-v4-pro",
             temperature=0,
-            model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
+            extra_body={"thinking": {"type": "enabled"}},
         )
     """
 

@@ -7,7 +7,6 @@ from schemas.finance import Asset
 from schemas.maintenance import DeduplicationReport
 from schemas.rag import VaultDocument, VaultArtifact, InsightRecord, MemoryRecord
 from schemas.valuation import ValuationModel
-from schemas.workflow import WorkflowStateModel, ResearchStateModel
 
 
 # ── validate_ticker unit tests ────────────────────────────────────────────
@@ -103,20 +102,6 @@ def test_deduplication_report_normalises_ticker():
         ticker="  aapl ", total_files=5, duplicate_groups=1, files_removed=2, files_kept=3
     )
     assert rpt.ticker == "AAPL"
-
-
-def test_workflow_state_model_normalises_ticker():
-    ws = WorkflowStateModel(
-        date="2025-01-01", run_datetime="2025-01-01T00:00:00", company="Test", ticker="  crm  "
-    )
-    assert ws.ticker == "CRM"
-
-
-def test_research_state_model_normalises_ticker():
-    rs = ResearchStateModel(
-        date="2025-01-01", company="Test", ticker="  crm  "
-    )
-    assert rs.ticker == "CRM"
 
 
 # ── validate_tickers helper tests (no Postgres / LangGraph dependency) ────

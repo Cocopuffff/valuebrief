@@ -24,6 +24,12 @@ from schemas.rag import (
     CitationRef as CitationRef,
     InsightRecord as InsightRecord,
     MemoryRecord as MemoryRecord,
+    ResearchTopic as ResearchTopic,
+    ThesisPillar as ThesisPillar,
+    PillarOutcome as PillarOutcome,
+    PillarType,
+    PillarStatus,
+    PillarOutcomeStatus,
 )
 from schemas.maintenance import (
     DuplicateGroup as DuplicateGroup,
@@ -34,8 +40,4 @@ from schemas.provider import (
     SearchResult as SearchResult,
     NewsResult as NewsResult,
     ScrapeResult as ScrapeResult,
-)
-from schemas.workflow import (
-    WorkflowStateModel as WorkflowStateModel,
-    ResearchStateModel as ResearchStateModel,
 )

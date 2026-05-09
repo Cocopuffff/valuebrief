@@ -1,5 +1,7 @@
+from schemas import ResearchTopic
 import json
 from langchain.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
+from langchain.tools import tool
 from typing import Any, Literal
 
 from schemas import AgentNode, ValuationModel
@@ -10,12 +12,47 @@ from utils.config import bull_model, bear_model
 
 logger = get_logger(__name__)
 
+
+@tool
+async def search_investment_memory(ticker: str, query: str, limit: int = 5) -> str:
+    """Search prior research memories for this ticker with a natural-language query.
+
+    Use this to check if specific claims were made in previous analyses.
+    Returns matching memory source excerpts with source metadata.
+
+    Args:
+        ticker: Stock ticker symbol (e.g., AAPL)
+        query: Natural-language search query
+        limit: Max results (default 5)
+    """
+    try:
+        from utils.embeddings import get_embedding
+        from utils.vector_memory import format_memory_for_context, search_similar
+        embedding = await get_embedding(query)
+        results = await search_similar(
+            embedding,
+            ticker=ticker,
+            limit=limit,
+            exclude_validity_statuses=["contradicted", "superseded", "stale"],
+        )
+        if not results:
+            return "No prior research memories found for this query."
+        s = "y" if len(results) == 1 else "ies"
+        lines = [f"Found {len(results)} prior research memor{s}:"]
+        for i, r in enumerate(results, 1):
+            lines.append(format_memory_for_context(r, i, source_excerpt_chars=1000))
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"Error searching memories: {e}"
+
+
 research_tools = [
     # FinancialDataProvider.get_asset_data,
     # FinancialDataProvider.get_sec_filings,
     FinancialDataProvider.get_latest_news,
     FinancialDataProvider.search,
-    FinancialDataProvider.scrape_website
+    FinancialDataProvider.scrape_website,
+    search_investment_memory,
 ]
 
 research_tools_by_name = {tool.name: tool for tool in research_tools}
@@ -76,8 +113,19 @@ def _prepare_messages_for_thesis(
             if msg.content:
                 parts.append(f"Analyst reasoning: {msg.content}")
 
-            tool_names = [tc["name"] for tc in msg.tool_calls]
-            parts.append(f"Tools called: {', '.join(tool_names)}")
+            tool_descriptions: list[str] = []
+            for tc in msg.tool_calls:
+                name = tc["name"]
+                args = tc.get("args", {})
+                if name == "scrape_website":
+                    url = args.get("url", "") if isinstance(args, dict) else str(args)
+                    tool_descriptions.append(f"scrape_website(url={url})")
+                elif name == "search":
+                    query = args.get("query", "") if isinstance(args, dict) else str(args)
+                    tool_descriptions.append(f"search(query={query})")
+                else:
+                    tool_descriptions.append(name)
+            parts.append(f"Tools called: {', '.join(tool_descriptions)}")
 
             i += 1
             while i < len(messages) and isinstance(messages[i], ToolMessage):
@@ -197,6 +245,44 @@ def _log_response(label: str, response: AIMessage) -> None:
         logger.info(f"[{label}] 🔧 Tool calls planned:\n" + '\n'.join(tools_planned))
 
 
+def _topic_value(topic: ResearchTopic | dict[str, Any], key: str, default: Any = "") -> Any:
+    if isinstance(topic, dict):
+        return topic.get(key, default)
+    return getattr(topic, key, default)
+
+
+def _format_topics(topics: list[ResearchTopic | dict[str, Any]]) -> str:
+    """Format ResearchTopic items into a Markdown prompt section."""
+    if not topics:
+        return "No prior research topics assigned."
+    lines = [
+        "## Prior Research Topics",
+        "Prioritize investigating these in your research:",
+        "",
+    ]
+    for i, t in enumerate(topics, 1):
+        question = _topic_value(t, "question")
+        rationale = _topic_value(t, "rationale")
+
+        lines.append(f"{i}. {question}")
+        if rationale:
+            lines.append(f"   Rationale: {rationale}")
+    return "\n".join(lines)
+
+
+_SOURCE_URL_RULES = """
+SOURCE CITATION RULES (MANDATORY):
+- When you make a major factual claim in your thesis, you MUST attach the source URL
+  immediately after the claim in parentheses.
+  Example: "Salesforce grew revenue 12% YoY (https://example.com/earnings-report)"
+- You are researching prior thesis pillars shown in the RAG context. Your job is to
+  provide fresh evidence that supports, weakens, contradicts, or revises each pillar.
+- Do NOT assign final memory outcomes (supported/weakened/revised/contradicted/stale).
+  The Judge will evaluate all evidence and make those determinations.
+- Focus on finding current, verifiable sources for every major claim.
+"""
+
+
 # ── Analyst nodes ─────────────────────────────────────────────────────────
 
 BULL_SYSTEM = """You are a bullish equity analyst grounded in value investing principles. You are researching {company} ({ticker}) to build the strongest possible case for buying it. Today is {date}. You have {remaining} research iterations remaining.
@@ -209,7 +295,10 @@ RESEARCH METHODOLOGY — follow this workflow each iteration:
 
 IMPORTANT: search and get_latest_news only return headlines and short snippets. You MUST call scrape_website on promising URLs to get the actual article content needed for a serious thesis.
 {prior_valuation}
-Your thesis should address: margin of safety, intrinsic value drivers, competitive moat, growth catalysts, and risk/reward asymmetry."""
+{rag_context}
+{topics}
+{source_rules}
+Your thesis should address: margin of safety, intrinsic value drivers, competitive moat, growth catalysts, and risk/reward asymmetry. When referencing prior thesis pillars, provide evidence that supports or challenges each one."""
 
 BEAR_SYSTEM = """You are a bearish equity analyst grounded in value investing principles. You are researching {company} ({ticker}) to build the strongest possible case for selling or avoiding it. Today is {date}. You have {remaining} research iterations remaining.
 
@@ -221,7 +310,10 @@ RESEARCH METHODOLOGY — follow this workflow each iteration:
 
 IMPORTANT: search and get_latest_news only return headlines and short snippets. You MUST call scrape_website on promising URLs to get the actual article content needed for a serious thesis.
 {prior_valuation}
-Your thesis should address: overvaluation risks, margin of safety concerns, competitive threats, earnings quality issues, and downside catalysts."""
+{rag_context}
+{topics}
+{source_rules}
+Your thesis should address: overvaluation risks, margin of safety concerns, competitive threats, earnings quality issues, and downside catalysts. When referencing prior thesis pillars, provide evidence that supports or challenges each one."""
 
 
 @log_node_execution
@@ -233,10 +325,17 @@ async def bull_analyst(state: ResearchState) -> dict:
 
     if iteration < state['max_iterations']:
         prior_valuation_ctx = _build_prior_valuation_context(state.get('existing_valuation'))
+        rag_ctx = state.get('rag_context', '') or '(No prior research context — fresh analysis.)'
+        topics_text = _format_topics(
+            state.get('research_topics', [])  # already filtered by side in orchestration
+        )
         system = BULL_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
             date=state['date'], remaining=remaining,
             prior_valuation=prior_valuation_ctx,
+            rag_context=rag_ctx,
+            topics=topics_text,
+            source_rules=_SOURCE_URL_RULES if state.get('rag_context') else '',
         )
         # Trim context to avoid unbounded growth
         trimmed = _trim_messages(state['messages'])
@@ -276,6 +375,9 @@ Your thesis MUST cover:
 - Growth catalysts
 - Risk/reward asymmetry
 
+SOURCE CITATION: Attach the source URL in parentheses after every major factual claim.
+Example: "The company grew revenue 12% YoY (https://example.com/report)."
+
 Your thesis MUST adhere strictly to standard Markdown formatting rules:
 - All headings MUST be surrounded by blank lines.
 - All lists MUST be surrounded by blank lines.
@@ -302,10 +404,17 @@ async def bear_analyst(state: ResearchState) -> dict:
 
     if iteration < state['max_iterations']:
         prior_valuation_ctx = _build_prior_valuation_context(state.get('existing_valuation'))
+        rag_ctx = state.get('rag_context', '') or '(No prior research context — fresh analysis.)'
+        topics_text = _format_topics(
+            state.get('research_topics', [])
+        )
         system = BEAR_SYSTEM.format(
             company=state['company'], ticker=state['ticker'],
             date=state['date'], remaining=remaining,
             prior_valuation=prior_valuation_ctx,
+            rag_context=rag_ctx,
+            topics=topics_text,
+            source_rules=_SOURCE_URL_RULES if state.get('rag_context') else '',
         )
         trimmed = _trim_messages(state['messages'])
         response = await bear_model_with_tools.ainvoke(
@@ -340,6 +449,9 @@ Your thesis MUST cover:
 - Competitive threats
 - Earnings quality issues
 - Downside catalysts
+
+SOURCE CITATION: Attach the source URL in parentheses after every major factual claim.
+Example: "The company faces increasing competition (https://example.com/analysis)."
 
 Your thesis MUST adhere strictly to standard Markdown formatting rules:
 - All headings MUST be surrounded by blank lines.
@@ -386,4 +498,3 @@ def should_continue(state: ResearchState) -> Literal[AgentNode.RESEARCH_TOOL_NOD
             return AgentNode.RESEARCH_TOOL_NODE
 
     return AgentNode.SUPERVISOR
-    

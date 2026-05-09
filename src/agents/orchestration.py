@@ -79,11 +79,15 @@ async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         "existing_valuation": state.get("valuation"),
         "max_iterations": config.bull.max_iterations,
         "iteration_count": 0,
-        "research_topics": [],
+        "research_topics": [
+            t for t in state.get("research_topics", [])
+            if t.get("side") in ("bull", "neutral")
+        ],
         "key_points": [],
         "thesis": "",
         "sources": [],
         "messages": [],
+        "rag_context": state.get("rag_context", ""),
     }
     result = await bull_subgraph.ainvoke(research_input)
     update = {"bull_thesis": result["thesis"], "sources": result["sources"]}
@@ -94,6 +98,7 @@ async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.S
             content=result["thesis"],
             source_type="bull_thesis",
             source_priority=1,
+            vectorize=False,
             metadata={
                 "agent": "bull",
                 "company": state.get("company", ""),
@@ -103,7 +108,6 @@ async def run_bull_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         )
         if artifact.path:
             update["vault_artifacts"] = [artifact.model_dump(mode="json")]
-            update["active_memory_ids"] = memory_ids_from_artifact(artifact)
     except Exception as e:
         logger.warning(f"[Bull Research] ⚠️ Failed to persist bull thesis: {e}")
 
@@ -132,11 +136,15 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         "existing_valuation": state.get("valuation"),
         "max_iterations": config.bear.max_iterations,
         "iteration_count": 0,
-        "research_topics": [],
+        "research_topics": [
+            t for t in state.get("research_topics", [])
+            if t.get("side") in ("bear", "neutral")
+        ],
         "key_points": [],
         "thesis": "",
         "sources": [],
         "messages": [],
+        "rag_context": state.get("rag_context", ""),
     }
     result = await bear_subgraph.ainvoke(research_input)
     update = {"bear_thesis": result["thesis"], "sources": result["sources"]}
@@ -147,6 +155,7 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
             content=result["thesis"],
             source_type="bear_thesis",
             source_priority=1,
+            vectorize=False,
             metadata={
                 "agent": "bear",
                 "company": state.get("company", ""),
@@ -156,7 +165,6 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
         )
         if artifact.path:
             update["vault_artifacts"] = [artifact.model_dump(mode="json")]
-            update["active_memory_ids"] = memory_ids_from_artifact(artifact)
     except Exception as e:
         logger.warning(f"[Bear Research] ⚠️ Failed to persist bear thesis: {e}")
 

@@ -24,8 +24,6 @@ Prefer importing from ``schemas.*`` directly in new code
 # from schemas.provider import NewsResult as NewsResult
 # from schemas.provider import ScrapeResult as ScrapeResult
 # from schemas.provider import SearchResult as SearchResult
-# from schemas.workflow import ResearchStateModel as ResearchStateModel
-# from schemas.workflow import WorkflowStateModel as WorkflowStateModel
 # from schemas.deprecated import AgentAction as DeprecatedAgentAction  # noqa: F401
 # from schemas.deprecated import NewsArticle as NewsArticle
 # from schemas.deprecated import Portfolio as Portfolio

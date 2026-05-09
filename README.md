@@ -12,76 +12,74 @@ Value Brief: Covering your assets. An automated daily digest that accumulates in
 
 Value Brief is powered by an agentic research workflow orchestrated by LangGraph. It relies on specialised AI agents that operate iteratively and securely maintain state using Supabase PostgreSQL as a checkpointer.
 
-- **Supervisor**: Controls workflow routing, validates inputs, and ensures all research parameters.
-- **Bull Analyst**: Operates standalone with recursive web scraping and research tooling to synthesise growth catalysts, competitive moats, and upside cases.
-- **Bear Analyst**: Utilizes matching toolsets independently to extract short theses, highlight speculative risks, downside scenarios, and mapping margin issues.
-- **Judge Analyst**: Synthesizes conflicting fundamental researches, and leverages a configured `ValuationModel` to execute a multi-stage Discounted Cash Flow (DCF). Weighs probability models (Bear/Base/Bull), terminal value limits, and produces a reconciled final decision based strictly on margin of safety.
+- **Supervisor**: Controls workflow routing, validates inputs, fetches financial data, and runs a multi-probe RAG retrieval against prior research memories before dispatching to analysts. Retrieved memories serve as testable hypotheses, not accepted facts.
+- **Bull Analyst**: Operates standalone with recursive web scraping and research tooling to synthesise growth catalysts, competitive moats, and upside cases. Can search prior vector memories via `search_investment_memory` and gather fresh evidence against prior pillars.
+- **Bear Analyst**: Utilizes matching toolsets independently to extract short theses, highlight speculative risks, downside scenarios, and mapping margin issues. Identically capable of searching prior memories and gathering current challenge evidence.
+- **Judge Analyst**: Synthesizes conflicting fundamental researches, leverages a configured `ValuationModel` to execute a multi-stage Discounted Cash Flow (DCF), and assigns pillar outcomes: supported, weakened, revised, contradicted, or stale. Weighs probability models (Bear/Base/Bull), terminal value limits, and produces a reconciled final decision based strictly on margin of safety.
 - **Report Generator**: Reconciles the output into isolated Markdown timelines (with segmented debug graphs vs presentation-ready final structures). Builds citation manifests and upserts valuations to Supabase.
-- **Curator**: Post-run knowledge maintenance agent. Manages the hybrid RAG lifecycle — marks cited memories, prunes stale vectors, consolidates old vault files into monthly syntheses, tracks thesis drift, deduplicates content, and monitors vector storage health.
+- **Curator**: Post-run knowledge maintenance agent. Manages the hybrid RAG lifecycle with outcome-aware citation logic — only `supported`/`weakened` memories get `is_cited=true` (survival signal); `contradicted`/`stale` memories are demoted with a `validity_status` that excludes them from future retrieval. Also prunes stale vectors, consolidates old vault files into monthly syntheses, tracks thesis drift, deduplicates content, and monitors vector storage health.
 
 ### Visualisation
 
 ```mermaid
-graph TD
-    S[Supervisor<br/>Validates inputs, fetches financial data<br/>Routes workflow, seeds vault]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 34, "rankSpacing": 42}} }%%
+flowchart LR
+    subgraph WORKFLOW["Agent Workflow"]
+        direction TB
+        S[Supervisor<br/>Validates inputs, fetches financial data<br/>Runs RAG retrieval, routes workflow<br/>Seeds vault with fundamentals]
 
-    subgraph "Research Tools (available to Analysts)"
-        WS[Web Search]
-        PW[Parse Website]
-        NS[News Search<br/>Last day]
+        subgraph ANALYSIS["Independent Analysis"]
+            direction LR
+            BA[Bull Analyst<br/>Recursive scraping and synthesis<br/>Growth catalysts, moats, upside<br/>Gathers current pillar evidence]
+            BE[Bear Analyst<br/>Recursive scraping and synthesis<br/>Short theses, risks, downside<br/>Gathers current challenge evidence]
+        end
+
+        subgraph TOOLS["Research Tools (available to Analysts)"]
+            direction LR
+            WS[Web Search]
+            PW[Parse Website]
+            NS[News Search<br/>Last day]
+            SM[Search Memory<br/>Prior vector research]
+        end
+
+        subgraph VALUATION["Valuation and Reconciliation"]
+            direction TB
+            J[Judge Analyst<br/>Synthesizes conflicting research<br/>Executes multi-stage DCF<br/>Weighs probability models<br/>Parses Memory Outcome labels]
+            VM[ValuationModel<br/>Two-stage 10-year DCF<br/>Gordon Growth terminal value]
+            J <-->|DCF assumptions and results| VM
+        end
+
+        R[Report Generator<br/>Assembles final + debug reports<br/>Builds citation manifest<br/>Upserts valuation to DB]
+        C[Curator<br/>Pillar lifecycle maintenance<br/>supported/weakened → active<br/>revised → superseded replacement<br/>contradicted/stale → inactive<br/>Thesis drift tracking<br/>Vault consolidation and pruning]
+        AVYF[Alpha Vantage and yfinance<br/>direct router call]
+        DONE[Final Output]
+
+        S --> ANALYSIS
+        ANALYSIS -.->|uses| TOOLS
+        ANALYSIS --> VALUATION
+        VALUATION --> R
+        R --> C
+        C --> DONE
+        S -.-> AVYF
     end
 
-    subgraph "Independent Analysis"
-        BA[Bull Analyst<br/>Recursive scraping and synthesis<br/>Growth catalysts, moats, upside]
-        BE[Bear Analyst<br/>Recursive scraping and synthesis<br/>Short theses, risks, downside]
+    subgraph PERSIST["Persistence Layer"]
+        direction TB
+        V[Local Vault<br/>Markdown cold store<br/>Daily research documents<br/>Monthly syntheses<br/>Block-level citation IDs]
+
+        subgraph PG["Supabase PostgreSQL"]
+            direction TB
+            DB[(Non-vector Tables<br/>LangGraph checkpointer<br/>valuations<br/>investment_pillars<br/>thesis_drifts)]
+            VMEM[(Vector Memory<br/>investment_memories + pgvector<br/>Semantic similarity search<br/>validity_status tracking<br/>Priority-tiered insights)]
+        end
     end
 
-    BA --> WS
-    BA --> PW
-    BA --> NS
-    BE --> WS
-    BE --> PW
-    BE --> NS
+    WORKFLOW -->|RAG retrieval, vault writes,<br/>valuation upserts, curation maintenance| PERSIST
 
-    S --> BA
-    S --> BE
-
-    BA --> J
-    BE --> J
-
-    subgraph "Valuation and Reconciliation"
-        J[Judge Analyst<br/>Synthesizes conflicting research<br/>Executes multi-stage DCF<br/>Weighs probability models<br/>Applies margin of safety]
-        VM[ValuationModel<br/>Two-stage 10-year DCF<br/>Gordon Growth terminal value]
-    end
-
-    J --> VM
-    VM --> J
-
-    J --> R[Report Generator<br/>Assembles final + debug reports<br/>Builds citation manifest<br/>Upserts valuation to DB]
-
-    R --> C[Curator<br/>Post-run knowledge maintenance<br/>Memory lifecycle management<br/>Thesis drift tracking<br/>Vault consolidation and pruning]
-
-    subgraph "Hybrid RAG Storage"
-        V[Local Vault<br/> Daily research documents<br/> Monthly syntheses<br/> Block-level citation IDs]
-        VMEM[Vector Memory<br/> Supabase pgvector<br/> Semantic similarity search<br/> Priority-tiered insights]
-    end
-
-    C --> V
-    C --> VMEM
-
-    S --> V
-
-    subgraph "Persistence Layer"
-        DB[(Supabase PostgreSQL<br/> LangGraph checkpointer<br/> Valuations table<br/> Thesis drifts table<br/> Investment memories vector table)]
-    end
-
-    C --> DB
-    R --> DB
-    S --> DB
-
-    S -.-> AV&YF[Alpha Vantage & yfinance<br/>direct router call]
-
-    C --> Done[Final Output]
+    classDef workflow fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#111827
+    classDef store fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#0f172a
+    class S,BA,BE,WS,PW,NS,SM,J,VM,R,C,AVYF,DONE workflow
+    class V,DB,VMEM store
 ```
 
 ## Sample Output Report
@@ -126,91 +124,133 @@ graph TD
 
 ## Hybrid RAG: Insight Lifecycle Management
 
-Value Brief maintains a dual-layer knowledge store that grows smarter with each run. Fresh research is written to both a **local Markdown vault** (cold storage) and a **Supabase pgvector table** (hot semantic storage). The Curator agent manages the full lifecycle — creation, citation, consolidation, pruning, and drift tracking — so the system self-maintains and avoids bloat.
+Value Brief maintains a pillar-first knowledge store that grows smarter with each run. Fresh research is written to a **local Markdown vault** for full audit history, while Supabase stores pillar identity, lifecycle state, and compact vector-search rows. The Curator agent manages creation, revision, consolidation, pruning, and drift tracking so the system self-maintains and avoids bloat.
 
 ### Storage Architecture
 
 | Layer                   | Storage                                                                                    | Purpose                                                                                                         | Retention                                              |
 | :---------------------- | :----------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------- |
-| **Vault** (cold)        | `data/vault/{TICKER}/` — Markdown files with YAML frontmatter and block-level citation IDs | Immutable, auditable record of every research document and monthly synthesis                                    | Indefinite (deduplicated by content hash)              |
-| **Vector Memory** (hot) | `investment_memories` table — 1536-dim pgvector embeddings via `text-embedding-3-small`    | Semantic similarity search across ticker-scoped insights; priority-tiered (0=noise, 1=secondary, 2=first-party) | Actively pruned; uncited vectors deleted after 90 days |
+| **Vault** (cold)        | `data/vault/{TICKER}/` plus `data/vault/{TICKER}/pillars/{pillar_id}.md`                  | Complete auditable record of research documents, source URLs, pillar dossiers, revision history, and citations | Indefinite (deduplicated by content hash)              |
+| **Pillar Registry**     | `investment_pillars` table                                                               | Stable pillar identity, lifecycle status, current vector pointer, and dossier link                              | Current and historical pillar identities               |
+| **Vector Memory** (hot) | `investment_memories` table — 1536-dim pgvector embeddings via `text-embedding-3-small`   | Compact semantic search rows for current pillars, drift checks, and summary consolidation                       | Actively pruned; compact rows only                     |
+
+Apply `scripts/03-investment_pillars_ddl.sql` and then run `scripts/backfill_pillar_dossiers.py` to migrate existing thesis-pillar memories into the pillar registry and local dossier files.
 
 ### Lifecycle Stages
 
 ```mermaid
-graph LR
-    subgraph "1. Creation (per run)"
-        SUP[Supervisor]
-        ANALYSTS[Analysts]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 24, "rankSpacing": 28}} }%%
+flowchart LR
+    subgraph LIFE["Insight Lifecycle"]
+        direction TB
+
+        subgraph STEP0["0. Retrieval (per run)"]
+            direction LR
+            S[Supervisor]
+            PROBES[Multi-probe<br/>semantic search]
+            PRIOR[Prior memories]
+            S --> PROBES --> PRIOR
+        end
+
+        subgraph STEP1["1. Creation (per run)"]
+            direction LR
+            ANALYSTS[Analysts]
+            OUTCOMES[Memory Outcomes<br/>supported/weakened/revised/<br/>contradicted/superseded/stale]
+            ANALYSTS --> OUTCOMES
+        end
+
+        subgraph STEP2["2. Curation (per run)"]
+            direction LR
+            REP[Report Generator]
+            CM[Citation Manifest]
+            CUR[Curator]
+            REP --> CM --> CUR
+        end
+
+        subgraph STEP3["3. Consolidation (monthly)"]
+            direction LR
+            OLD[Vault files 90 days old]
+            GRP[Monthly Groups]
+            SYNTH[(Monthly Synthesis)]
+            OLD --> GRP --> SYNTH
+        end
+
+        subgraph STEP4["4. Aggressive Pruning"]
+            direction LR
+            OLDEST[Oldest summary vectors]
+            HIST[(Historical Summary)]
+            OLDEST --> HIST
+        end
+
+        subgraph STEP5["5. Drift Tracking"]
+            direction LR
+            OLDV[Prior valuation]
+            NEWV[Current judge decision]
+            DRIFT[Delta Calculation]
+            OLDV --> DRIFT
+            NEWV --> DRIFT
+        end
+
+        subgraph STEP6["6. Deduplication"]
+            direction LR
+            DUP[Duplicate vault files]
+        end
+
+        STEP0 ~~~ STEP1
+        STEP1 ~~~ STEP2
+        STEP2 ~~~ STEP3
+        STEP3 ~~~ STEP4
+        STEP4 ~~~ STEP5
+        STEP5 ~~~ STEP6
     end
 
-    subgraph "2. Curation (per run)"
-        REP[Report Generator]
-        CM[Citation Manifest]
-        CUR[Curator]
+    subgraph TOUCH["Persistence Touchpoints"]
+        direction TB
+        T0[0 read Vector Memory]
+        T1[1 write Local Vault<br/>and Vector Memory]
+        T2[2 update Vector Memory<br/>and valuations]
+        T3[3 archive Local Vault<br/>swap vectors to summary]
+        T4[4 merge old Vector Memory]
+        T5[5 read valuations<br/>record thesis_drifts]
+        T6[6 dedupe Local Vault]
+        T0 ~~~ T1
+        T1 ~~~ T2
+        T2 ~~~ T3
+        T3 ~~~ T4
+        T4 ~~~ T5
+        T5 ~~~ T6
     end
 
-    subgraph "3. Consolidation (monthly)"
-        OLD[Vault files 90 days old]
-        GRP[Monthly Groups]
-        SYNTH[(Monthly Synthesis)]
+    subgraph PERSIST["Persistence Layer"]
+        direction TB
+        VAULT[(Local Vault<br/>Markdown cold store<br/>research docs + monthly syntheses<br/>block-level citation IDs)]
+
+        subgraph PG["Supabase PostgreSQL"]
+            direction TB
+            VEC[(Vector Memory<br/>investment_memories + pgvector<br/>1536-dim embeddings<br/>validity_status)]
+            PGTABLES[(Non-vector Tables<br/>LangGraph checkpointer<br/>valuations<br/>investment_pillars<br/>thesis_drifts)]
+        end
     end
 
-    subgraph "4. Aggressive Pruning"
-        OLDEST[Oldest summary vectors]
-        HIST[(Historical Summary)]
-    end
+    LIFE --> TOUCH
+    TOUCH --> PERSIST
 
-    subgraph "5. Drift Tracking"
-        OLDV[Prior valuation]
-        NEWV[Current judge decision]
-        DRIFT[Delta Calculation]
-    end
-
-    subgraph "6. Deduplication"
-        DUP[Duplicate vault files]
-    end
-
-    VAULT[(Local Vault)]
-    VEC[(Vector Memory)]
-    DRIFTTBL[(thesis_drifts)]
-
-    SUP -->|fundamentals| VAULT
-    SUP -->|embeddings| VEC
-    ANALYSTS -->|research docs| VAULT
-    ANALYSTS -->|insights| VEC
-    REP -->|builds manifest| CM
-    CM -->|resolves block IDs| VAULT
-    CUR -->|mark cited, delete uncited| VEC
-    OLD -->|group by month| GRP
-    GRP -->|LLM synthesize| SYNTH
-    SYNTH -->|archive sources| VAULT
-    SYNTH -->|swap granular → summary| VEC
-    OLDEST -->|LLM merge| HIST
-    HIST -->|keep 3 most recent| VEC
-    OLDV -->|compare verdict + EV| DRIFT
-    NEWV --> DRIFT
-    DRIFT -->|record δ% + key changes| DRIFTTBL
-    DUP -->|keep earliest, remove rest| VAULT
-
-    linkStyle 0 stroke:#3b82f6,stroke-width:2px
-    linkStyle 1 stroke:#3b82f6,stroke-width:2px
-    linkStyle 2 stroke:#000000,stroke-width:2px
-    linkStyle 3 stroke:#000000,stroke-width:2px
-    linkStyle 4 stroke:#f59e0b,stroke-width:2px
-    linkStyle 5 stroke:#f59e0b,stroke-width:2px
-    linkStyle 6 stroke:#f59e0b,stroke-width:2px
-    linkStyle 7 stroke:#10b981,stroke-width:2px
-    linkStyle 8 stroke:#10b981,stroke-width:2px
-    linkStyle 9 stroke:#10b981,stroke-width:2px
-    linkStyle 10 stroke:#10b981,stroke-width:2px
-    linkStyle 11 stroke:#ef4444,stroke-width:2px
-    linkStyle 12 stroke:#ef4444,stroke-width:2px
-    linkStyle 13 stroke:#8b5cf6,stroke-width:2px
-    linkStyle 14 stroke:#8b5cf6,stroke-width:2px
-    linkStyle 15 stroke:#8b5cf6,stroke-width:2px
-    linkStyle 16 stroke:#ef4444,stroke-width:2px
+    classDef store fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#0f172a
+    classDef lifecycle fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#111827
+    classDef touch fill:#fff7ed,stroke:#f59e0b,stroke-width:1px,color:#111827
+    class VAULT,VEC,PGTABLES store
+    class S,PROBES,PRIOR,ANALYSTS,OUTCOMES,REP,CM,CUR,OLD,GRP,SYNTH,OLDEST,HIST,OLDV,NEWV,DRIFT,DUP lifecycle
+    class T0,T1,T2,T3,T4,T5,T6 touch
 ```
+
+#### 0. Retrieval — Every Run (Before Research)
+
+Before dispatching to analysts, the Supervisor queries the vector store for **prior research memories** on the current ticker:
+
+- Embeds five fixed semantic probes targeting moat/growth, risks, valuation assumptions, thesis drift, and prior valuation.
+- Merges results with a weighted scoring formula that rewards first-party, cited, and previously-supported memories.
+- Default retrieval **excludes** memories previously labeled `contradicted`, `superseded`, or `stale` — these no longer compete for analyst attention. The thesis-drift probe can optionally include them to explain how the thesis changed.
+- Retrieved memories are formatted into a structured `ResearchBrief` with inline vault citation strings and passed to analysts as **testable hypotheses**, not accepted facts.
 
 #### 1. Creation — Every Run
 
@@ -218,14 +258,15 @@ graph LR
 - Analyst research findings (Bull + Bear) are written to the vault as timestamped, content-hashed Markdown documents.
 - Each paragraph in a vault document receives a block ID (`^block-xxxxxxxx`), enabling granular citation.
 - Insights are embedded via `text-embedding-3-small` (1536-dim) and stored in the `investment_memories` vector table with ticker-scoped metadata and a `source_priority` tier.
+- The Judge labels each prior pillar with an outcome: `supported`, `weakened`, `revised`, `contradicted`, or `stale`. Contradicted outcomes must cite newer evidence that refutes the prior pillar.
 
 #### 2. Curation — Every Run
 
-After the report is generated, the **Curator** performs housekeeping:
+After the report is generated, the **Curator** performs **outcome-aware** housekeeping:
 
 1. **Citation Manifest**: Scans the final report for inline citation references (`(See: file.md#^block-id)`) and resolves each to its source paragraph in the vault.
-2. **Mark Cited Memories**: Any vector memory referenced in the manifest is marked `is_cited = true` in Supabase. Citations act as a survival signal — cited memories are protected from pruning.
-3. **Delete Uncited Memories**: Vectors created within the active window (default 90 days) that were _not_ cited are deleted, preventing stale or irrelevant embeddings from accumulating.
+2. **Outcome-Gated Citation Marking**: The Judge extracts Memory Outcome labels from both analyst theses. Only `supported` and `weakened` memories remain active — this is a **survival signal**, not a "mentioned" flag. `contradicted`, `superseded`, and `stale` memories are demoted via a `validity_status` metadata field, which excludes them from future retrieval.
+3. **Delete Uncited Memories**: Vectors created within the active window (default 90 days) that were _not_ cited (and any with `validity_status = stale`) are deleted, preventing irrelevant embeddings from accumulating.
 
 #### 3. Consolidation — Monthly
 
@@ -262,15 +303,17 @@ On a ticker's very first run, no prior valuation exists, so drift recording is s
 
 The Curator scans the vault for files with identical SHA-256 content hashes. Within each duplicate group, the **earliest** file (by date in filename) is preserved and the rest are removed. This prevents redundant research documents from bloating the vault when the same URL is scraped across multiple runs.
 
-### Citation System
+### Citation & Outcome System
 
-Value Brief uses a lightweight, file-based citation scheme to connect assertions in the final report back to their source paragraphs:
+Value Brief uses a lightweight, file-based citation scheme combined with analyst-assigned outcome labels to maintain a self-correcting vector memory:
 
 - **In the vault**: Every paragraph in a Markdown document is tagged with a block ID: `^block-a1b2c3d4`.
 - **In the report**: Agents reference sources inline using the pattern `(See: 2026-05-02_a1b2c3d4.md#^block-a1b2c3d4)`.
-- **At curation time**: `build_citation_manifest()` parses the report text, resolves each block ID to the corresponding vault paragraph via `resolve_citation()`, and the Curator uses this manifest to protect cited vector memories.
+- **Memory Outcomes**: Each analyst assigns every retrieved prior memory one of four labels — `supported`, `weakened`, `revised`, `contradicted`, or `stale`. The Judge parses these blocks and merges conflicting labels conservatively (e.g., `contradicted` beats `supported`).
+- **At curation time**: the Curator keeps `supported` and `weakened` pillars active, turns revised prior rows into `superseded` rows with replacement pointers, and excludes `contradicted`, `superseded`, and `stale` pillars from normal retrieval without deleting the local dossier.
+- **Retrieval feedback loop**: Memories labeled `contradicted`, `superseded`, or `stale` are excluded by default from subsequent retrieval runs, so they stop competing for analyst attention. The thesis-drift probe can optionally surface them when explaining how the thesis changed over time.
 
-This creates a **provenance chain**: report assertion → block ID → vault paragraph → vector embedding, enabling auditability while keeping the vector layer relevant.
+This creates a **provenance chain with outcome feedback**: report assertion → block ID → vault paragraph → vector embedding → analyst verdict → curation decision → future retrieval quality.
 
 ## Getting Started
 

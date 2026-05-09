@@ -288,39 +288,142 @@ class TestScrapeResult:
         assert not sr.truncated
 
 
-# ── Workflow ─────────────────────────────────────────────────────────────
+# ── ThesisPillar & PillarOutcome ────────────────────────────────────────────
+from schemas.rag import ThesisPillar, PillarOutcome, PillarType, PillarStatus
 
-class TestWorkflowStateModel:
-    def test_valid_minimal(self):
-        ws = WorkflowStateModel(
-            date="2026-05-01",
-            run_datetime="2026-05-01T12:00:00",
-            company="Apple Inc.",
-            ticker="AAPL",
+
+class TestThesisPillar:
+    def test_minimal_construction(self):
+        p = ThesisPillar(
+            pillar_id="CRM-moat-001",
+            pillar_type="moat",
+            statement="Salesforce has a wide economic moat.",
         )
-        assert ws.bull_thesis == ""
-        assert ws.vault_artifacts == []
+        assert p.pillar_id == "CRM-moat-001"
+        assert p.pillar_type == "moat"
+        assert p.statement == "Salesforce has a wide economic moat."
+        assert p.rationale == ""
+        assert p.valuation_impact == ""
+        assert p.source_urls == []
+        assert p.evidence_citations == []
+        assert p.status == "supported"
 
-    def test_rejects_missing_required(self):
+    def test_full_construction(self):
+        p = ThesisPillar(
+            pillar_id="CRM-risk-001",
+            pillar_type="risk",
+            statement="Competitive pressure from Microsoft.",
+            rationale="Microsoft Dynamics 365 grew 25% YoY.",
+            valuation_impact="Reduces terminal value growth assumption by 1%.",
+            source_urls=["https://example.com/report"],
+            evidence_citations=["file.md#^block123"],
+            status="weakened",
+        )
+        assert p.status == "weakened"
+        assert len(p.source_urls) == 1
+        assert len(p.evidence_citations) == 1
+
+    def test_rejects_invalid_pillar_type(self):
         with pytest.raises(ValueError):
-            WorkflowStateModel(date="2026-05-01")
+            ThesisPillar(
+                pillar_id="X-001",
+                pillar_type="invalid_type",
+                statement="Bad.",
+            )
 
+    def test_rejects_invalid_status(self):
+        with pytest.raises(ValueError):
+            ThesisPillar(
+                pillar_id="X-001",
+                pillar_type="moat",
+                statement="Valid claim.",
+                status="deleted",
+            )
 
-class TestResearchStateModel:
-    def test_valid_minimal(self):
-        rs = ResearchStateModel(
-            date="2026-05-01",
-            company="Apple Inc.",
-            ticker="AAPL",
+    def test_all_valid_pillar_types(self):
+        valid: list[PillarType] = [
+            "moat", "growth", "risk", "valuation_assumption",
+            "capital_allocation", "thesis_change",
+        ]
+        for pt in valid:
+            p = ThesisPillar(pillar_id="X-001", pillar_type=pt, statement="Test.")
+            assert p.pillar_type == pt
+
+    def test_all_valid_statuses(self):
+        valid: list[PillarStatus] = ["supported", "weakened", "superseded", "contradicted", "stale"]
+        for s in valid:
+            p = ThesisPillar(pillar_id="X-001", pillar_type="moat", statement="Test.", status=s)
+            assert p.status == s
+
+    def test_rejects_legacy_updated_as_stored_status(self):
+        with pytest.raises(ValueError):
+            ThesisPillar(
+                pillar_id="X-001",
+                pillar_type="moat",
+                statement="Test.",
+                status="updated",
+            )
+
+    def test_serialization_roundtrip(self):
+        p = ThesisPillar(
+            pillar_id="CRM-moat-001",
+            pillar_type="moat",
+            statement="Salesforce has a wide moat.",
+            rationale="High switching costs.",
+            valuation_impact="Supports premium multiple.",
+            source_urls=["https://example.com"],
+            evidence_citations=["file.md#^block123"],
+            status="supported",
         )
-        assert rs.max_iterations == 3
-        assert rs.iteration_count == 0
+        data = p.model_dump(mode="json")
+        p2 = ThesisPillar(**data)
+        assert p2.pillar_id == p.pillar_id
+        assert p2.source_urls == p.source_urls
 
-    def test_defaults(self):
-        rs = ResearchStateModel(
-            date="2026-05-01",
-            company="Tesla Inc.",
-            ticker="TSLA",
+
+class TestPillarOutcome:
+    def test_minimal_construction(self):
+        o = PillarOutcome(
+            memory_id="550e8400-e29b-41d4-a716-446655440000",
+            pillar_id="CRM-moat-001",
+            status="supported",
         )
-        assert rs.research_topics == []
-        assert rs.key_points == []
+        assert o.memory_id == "550e8400-e29b-41d4-a716-446655440000"
+        assert o.pillar_id == "CRM-moat-001"
+        assert o.status == "supported"
+        assert o.reason == ""
+        assert o.replacement_statement == ""
+        assert o.source_urls == []
+
+    def test_updated_outcome_maps_to_revised(self):
+        o = PillarOutcome(
+            memory_id="550e8400-e29b-41d4-a716-446655440000",
+            pillar_id="CRM-moat-001",
+            status="updated",
+            reason="Revenue growth accelerated beyond prior estimate.",
+            replacement_statement="CRM now growing at 15% vs prior 12% assumption.",
+            source_urls=["https://example.com/new-earnings"],
+        )
+        assert o.status == "revised"
+        assert o.replacement_statement != ""
+
+    def test_rejects_invalid_status(self):
+        with pytest.raises(ValueError):
+            PillarOutcome(
+                memory_id="550e8400-e29b-41d4-a716-446655440000",
+                pillar_id="X-001",
+                status="deleted",
+            )
+
+    def test_serialization_roundtrip(self):
+        o = PillarOutcome(
+            memory_id="550e8400-e29b-41d4-a716-446655440000",
+            pillar_id="CRM-moat-001",
+            status="contradicted",
+            reason="New competitor entered the market.",
+            source_urls=["https://example.com/competitor"],
+        )
+        data = o.model_dump(mode="json")
+        o2 = PillarOutcome(**data)
+        assert o2.memory_id == o.memory_id
+        assert o2.reason == o.reason

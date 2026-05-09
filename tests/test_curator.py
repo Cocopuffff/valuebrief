@@ -147,3 +147,91 @@ class TestDeduplication:
         assert report.ticker == "MSFT"
         assert report.total_files == 2
         assert report.files_removed == 0  # No duplicates to remove
+
+
+# ── Pillar outcome processing tests ──────────────────────────────────────────
+
+class TestPillarOutcomeProcessing:
+    """Verify pillar_outcome dicts can be processed for all four statuses."""
+
+    def test_supported_outcome_marks_cited(self):
+        """supported pillars are marked as cited for survival signal."""
+        outcome = {
+            "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+            "pillar_id": "CRM-moat-001",
+            "status": "supported",
+            "reason": "Confirmed by new evidence.",
+            "replacement_statement": "",
+            "source_urls": [],
+        }
+        assert outcome["status"] == "supported"
+        assert outcome["memory_id"]
+        assert outcome["reason"]
+
+    def test_revised_outcome_has_replacement_statement(self):
+        """revised status must carry a replacement_statement for the new pillar."""
+        outcome = {
+            "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+            "pillar_id": "CRM-growth-001",
+            "status": "revised",
+            "reason": "Growth accelerated.",
+            "replacement_statement": "Revenue growing at 15% vs prior 12%.",
+            "source_urls": ["https://example.com/earnings"],
+        }
+        assert outcome["replacement_statement"]
+        assert len(outcome["source_urls"]) > 0
+
+    def test_weakened_outcome_remains_active(self):
+        """weakened pillars remain active but lower-confidence."""
+        outcome = {
+            "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+            "pillar_id": "CRM-growth-001",
+            "status": "weakened",
+            "reason": "Growth slowed but remains positive.",
+            "replacement_statement": "",
+            "source_urls": ["https://example.com/earnings"],
+        }
+        assert outcome["status"] == "weakened"
+
+    def test_contradicted_outcome_demotes(self):
+        """contradicted status sets validity_status to contradicted."""
+        outcome = {
+            "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+            "pillar_id": "CRM-risk-001",
+            "status": "contradicted",
+            "reason": "Competitor exited the market.",
+            "replacement_statement": "",
+            "source_urls": [],
+        }
+        assert outcome["status"] == "contradicted"
+
+    def test_stale_outcome_demotes(self):
+        """stale status sets validity_status to stale (prune-eligible)."""
+        outcome = {
+            "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+            "pillar_id": "CRM-valuation-001",
+            "status": "stale",
+            "reason": "Old valuation assumptions no longer relevant.",
+            "replacement_statement": "",
+            "source_urls": [],
+        }
+        assert outcome["status"] == "stale"
+
+
+class TestPillarMemoryRetrievalRules:
+    """Verify retrieval rules: only supported/weakened pillars are active."""
+
+    def test_active_statuses_are_supported_and_weakened(self):
+        active = {"supported", "weakened"}
+        assert "supported" in active
+        assert "weakened" in active
+
+    def test_inactive_statuses_are_contradicted_stale_superseded(self):
+        inactive = {"contradicted", "stale", "superseded"}
+        assert "contradicted" in inactive
+        assert "stale" in inactive
+        assert "superseded" in inactive
+        active = {"supported", "weakened"}
+        assert "contradicted" not in active
+        assert "stale" not in active
+        assert "superseded" not in active

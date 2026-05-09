@@ -45,9 +45,11 @@ CONSOLIDATION_CUTOFF_DAYS = config.curator.consolidation_cutoff_days
 async def curator_agent(state: WorkflowState) -> Command[Literal["__end__"]]:
     """Post-report maintenance node.
 
-    Receives the final report, thesis, and active memory IDs from upstream
-    nodes.  Performs pruning, deduplication, consolidation, and storage
-    health checks.
+    Manages thesis pillar lifecycle:
+    1. Processes pillar_outcomes from the Judge — marks prior pillars as
+       supported / weakened / revised / contradicted / stale.
+    2. Persists new or revised thesis_pillars as active vector memories.
+    3. Runs vault deduplication, monthly consolidation, and storage checks.
     """
     ticker = state["ticker"].upper()
     logs: list[str] = []
@@ -58,40 +60,167 @@ async def curator_agent(state: WorkflowState) -> Command[Literal["__end__"]]:
 
     _log(f"🧹 Starting maintenance for {ticker}")
 
-    # ── 1. Citation manifest ────────────────────────────────────────────
-    report_text = state.get("final_report", "")
-    manifest = build_citation_manifest(report_text, ticker)
-    resolved_refs = sum(1 for ref in manifest if ref.resolved_text)
-    _log(f"📋 Citation manifest: {len(manifest)} reference(s), {resolved_refs} resolved")
+    # ── 1. Persist new/revised thesis pillars ───────────────────────────
+    pillar_outcomes = state.get("pillar_outcomes", [])
+    thesis_pillars = state.get("thesis_pillars", [])
+    _log(f"🏛️ Received {len(thesis_pillars)} thesis pillars + {len(pillar_outcomes)} outcomes")
 
-    vault_artifacts = state.get("vault_artifacts", [])
-    active_ids = state.get("active_memory_ids", [])
-    _log(f"📁 Vault artifacts: {len(vault_artifacts)} artifact(s), {len(active_ids)} vector(s)")
+    outcome_by_pillar = {
+        str(o.get("pillar_id", "")): str(o.get("status", ""))
+        for o in pillar_outcomes
+        if o.get("pillar_id")
+    }
 
-    # ── 2. Mark cited memories ──────────────────────────────────────────
-    cited_memory_ids = _memory_ids_for_citations(manifest, vault_artifacts)
-    if cited_memory_ids:
-        cited_count = await vector_memory.mark_memories_cited(cited_memory_ids)
-    else:
-        cited_count = 0
-    _log(f"✅ Marked {cited_count} cited vector(s)")
+    new_pillar_ids: list[str] = []
+    if thesis_pillars:
+        from schemas.rag import ThesisPillar
+        pillars: list[ThesisPillar] = []
+        for p_dict in thesis_pillars:
+            try:
+                pillar = ThesisPillar(**p_dict)
+            except Exception as e:
+                _log(f"⚠️ Skipping malformed pillar: {e}")
+                continue
 
-    # ── 3. Delete uncited memories (active window only) ──────────────────
-    #    Only prune uncited vectors within the active window (< CUTOFF days).
-    #    Older vectors are left for consolidation to handle atomically.
+            matched_id = pillar.matched_pillar_id or pillar.pillar_id
+            outcome_status = outcome_by_pillar.get(matched_id, "")
+            should_persist = (
+                not matched_id
+                or outcome_status in ("revised", "weakened")
+                or pillar.status == "weakened"
+            )
+            if should_persist:
+                pillars.append(pillar)
+
+        if pillars:
+            new_pillar_ids = await vector_memory.persist_thesis_pillars(
+                ticker=ticker,
+                pillars=pillars,
+            )
+            _log(f"🏛️ Persisted {len(new_pillar_ids)} new/revised thesis pillar memories")
+
+    # ── 2. Process pillar outcomes from the Judge ───────────────────────
+    if pillar_outcomes:
+        supported_count = 0
+        weakened_count = 0
+        revised_count = 0
+        demoted_count = 0
+
+        for outcome_dict in pillar_outcomes:
+            memory_id = outcome_dict.get("memory_id", "")
+            status = outcome_dict.get("status", "")
+            if status == "updated":
+                status = "revised"
+            pillar_id = outcome_dict.get("pillar_id", "")
+            reason = outcome_dict.get("reason", "")
+            source_urls = outcome_dict.get("source_urls", [])
+
+            if not memory_id:
+                continue
+
+            if status == "supported":
+                await vector_memory.mark_memories_cited([memory_id])
+                await vector_memory.append_pillar_dossier_event(
+                    memory_id,
+                    status="supported",
+                    lifecycle_event="supported",
+                    lifecycle_reason=reason,
+                    source_urls=source_urls,
+                )
+                supported_count += 1
+
+            elif status == "weakened":
+                await vector_memory.update_validity_status([memory_id], "weakened")
+                await vector_memory.append_pillar_dossier_event(
+                    memory_id,
+                    status="weakened",
+                    lifecycle_event="weakened",
+                    lifecycle_reason=reason,
+                    source_urls=source_urls,
+                )
+                weakened_count += 1
+
+            elif status == "revised":
+                replacement_id = await vector_memory.get_current_pillar_memory_id(pillar_id)
+                if replacement_id and replacement_id != memory_id:
+                    await vector_memory.mark_pillar_transition(
+                        memory_id,
+                        "superseded",
+                        superseded_by=replacement_id,
+                    )
+                    event_status = "superseded"
+                else:
+                    _log(f"⚠️ Revised pillar {pillar_id} has no replacement vector yet; keeping prior memory active")
+                    event_status = "supported"
+                await vector_memory.append_pillar_dossier_event(
+                    memory_id,
+                    status=event_status,
+                    lifecycle_event="revised",
+                    lifecycle_reason=reason,
+                    source_urls=source_urls,
+                )
+                revised_count += 1
+
+            elif status in ("contradicted", "stale"):
+                await vector_memory.update_validity_status(
+                    [memory_id], status
+                )
+                await vector_memory.append_pillar_dossier_event(
+                    memory_id,
+                    status=status,
+                    lifecycle_event=status,
+                    lifecycle_reason=reason,
+                    source_urls=source_urls,
+                )
+                demoted_count += 1
+            else:
+                logger.warning(f"[Curator] Unknown pillar outcome status: {status}")
+                _log(f"⚠️ Unknown pillar outcome status: {status}")
+
+        _log(
+            f"🏛️ Pillar outcomes: {supported_count} supported, "
+            f"{weakened_count} weakened, {revised_count} revised, "
+            f"{demoted_count} contradicted/stale"
+        )
+
+    try:
+        merged_pillars = await vector_memory.consolidate_near_duplicate_pillars(ticker)
+        if merged_pillars:
+            _log(f"🔁 Consolidated {merged_pillars} near-duplicate pillar(s)")
+    except Exception as e:
+        _log(f"⚠️ Pillar duplicate consolidation skipped: {e}")
+
+    # ── 3. Prune non-pillar memories (legacy paragraph memories) ────────
+    #    Only pillar memories participate in normal retrieval. Legacy
+    #    paragraph memories past the consolidation window are cleaned up.
     cutoff_date = (
         datetime.now(timezone.utc) - timedelta(days=CONSOLIDATION_CUTOFF_DAYS)
     ).isoformat()
-    deleted = await vector_memory.delete_uncited_memories(
-        ticker, created_after=cutoff_date
-    )
-    _log(f"🗑️ Pruned {deleted} uncited active memories")
+    try:
+        import psycopg.rows
+        pool = await vector_memory.get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM investment_memories
+                    WHERE ticker = %s
+                      AND created_at < %s
+                      AND (metadata->>'source_type' IS NULL
+                           OR metadata->>'source_type' != 'thesis_pillar')
+                      AND is_cited = false
+                    """,
+                    (ticker, cutoff_date),
+                )
+                pruned = cur.rowcount
+                if pruned:
+                    _log(f"🗑️ Pruned {pruned} uncited non-pillar memories older than cutoff")
+    except Exception as e:
+        _log(f"⚠️ Non-pillar prune skipped: {e}")
 
     # ── 4. Thesis drift tracking ────────────────────────────────────────
     valuation = state.get("valuation")
     if valuation:
-        # Extract verdicts for drift tracking
-        prior_thesis_data = None
         if valuation.thesis_data:
             prior_decision = valuation.thesis_data.get("final_decision", "")
         else:
@@ -99,13 +228,12 @@ async def curator_agent(state: WorkflowState) -> Command[Literal["__end__"]]:
 
         new_decision = state.get("judge_decision", "")
 
-        # Extract verdict (first line of the decision is typically the verdict)
         old_verdict = _extract_verdict(prior_decision)
         new_verdict = _extract_verdict(new_decision)
 
         if old_verdict or new_verdict:
             old_ev = valuation.expected_value if valuation else None
-            new_ev = valuation.expected_value  # Current run's value
+            new_ev = valuation.expected_value
             await record_drift(
                 ticker=ticker,
                 old_verdict=old_verdict or "N/A",
@@ -130,6 +258,10 @@ async def curator_agent(state: WorkflowState) -> Command[Literal["__end__"]]:
     consolidated = await _consolidate_monthly(ticker)
     if consolidated:
         _log(f"📦 Consolidated {consolidated} file(s) into monthly syntheses")
+
+    summary_deduped = await _consolidate_duplicate_summaries(ticker)
+    if summary_deduped:
+        _log(f"📚 Consolidated {summary_deduped} near-duplicate summary vector(s)")
 
     # ── 7. Storage health check (500MB guardrail) ───────────────────────
     try:
@@ -403,6 +535,22 @@ async def _consolidate_monthly(ticker: str) -> int:
 
         try:
             embedding = await get_embedding(synthesis_content)
+
+            # Read back synthesis to capture citation metadata
+            citation_extra: dict = {}
+            try:
+                synth_doc = reader.read_document(synthesis_path)
+                citation_extra["filename"] = synthesis_path.name
+                citation_extra["local_path"] = str(synthesis_path)
+                if synth_doc.block_map:
+                    first_bid = next(iter(synth_doc.block_map))
+                    citation_extra["block_id"] = first_bid
+                    citation_extra["citation"] = (
+                        f"{synthesis_path.name}#^{first_bid}"
+                    )
+            except Exception:
+                pass  # Best-effort — citation metadata is optional
+
             await vector_memory.upsert_summary_vector(
                 ticker=ticker,
                 month=month,
@@ -412,6 +560,7 @@ async def _consolidate_monthly(ticker: str) -> int:
                     "source_files_count": len(new_files),
                     "vectors_consolidated": deleted_vectors,
                     "incremental": is_incremental,
+                    **citation_extra,
                 },
             )
         except Exception as e:
@@ -551,3 +700,48 @@ async def _aggressive_prune() -> int:
             )
 
     return total_deleted
+
+
+async def _consolidate_duplicate_summaries(ticker: str) -> int:
+    """Collapse near-duplicate monthly/historical summary vectors."""
+    pairs = await vector_memory.find_near_duplicate_summary_pairs(ticker)
+    if not pairs:
+        return 0
+
+    used: set[str] = set()
+    consolidated = 0
+    for pair in pairs:
+        keeper_id = str(pair.get("keeper_memory_id") or "")
+        duplicate_id = str(pair.get("duplicate_memory_id") or "")
+        if not keeper_id or not duplicate_id or keeper_id in used or duplicate_id in used:
+            continue
+
+        keeper_summary = str(pair.get("keeper_summary") or "")
+        duplicate_summary = str(pair.get("duplicate_summary") or "")
+        raw_dump = f"### Existing Summary\n{keeper_summary}\n\n### Duplicate Summary\n{duplicate_summary}"
+        prompt = (
+            f"You are consolidating near-duplicate historical research summaries for {ticker}.\n"
+            "Synthesize one concise replacement summary. Preserve durable thesis facts, "
+            "important numeric specifics, and avoid inventing data.\n\n"
+            f"{raw_dump}"
+        )
+        try:
+            response = await curator_model.ainvoke(prompt)
+            summary_text = str(response.content)
+        except Exception:
+            summary_text = f"{keeper_summary}\n\n{duplicate_summary}"
+
+        try:
+            embedding = await get_embedding(summary_text)
+            await vector_memory.merge_to_summary_vector(
+                ticker=ticker,
+                memory_ids=[keeper_id, duplicate_id],
+                summary_text=summary_text,
+                embedding=embedding,
+            )
+            used.update({keeper_id, duplicate_id})
+            consolidated += 1
+        except Exception as e:
+            logger.warning("[Curator] Duplicate summary consolidation failed for %s: %s", ticker, e)
+
+    return consolidated

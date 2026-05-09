@@ -46,6 +46,38 @@ class TestTagBlocks:
         assert tagged == ""
         assert len(block_map) == 0
 
+    def test_headings_are_attached_to_content_not_standalone(self):
+        content = "# Salesforce\n\n## Executive Summary\n\nRevenue grew 12% YoY."
+        tagged, block_map = _tag_blocks(content)
+
+        assert len(block_map) == 1
+        block = next(iter(block_map.values()))
+        assert block.startswith("# Salesforce\n## Executive Summary")
+        assert "Revenue grew 12% YoY." in block
+        assert "# Salesforce ^block-" not in tagged
+        assert "## Executive Summary ^block-" not in tagged
+
+    def test_lists_and_tables_remain_resolvable_blocks(self):
+        content = """# Thesis
+
+## Catalysts
+
+- Agentforce adoption is accelerating.
+- Buybacks lift per-share FCF.
+
+## Metrics
+
+| Metric | Value |
+| --- | --- |
+| Revenue growth | 12% |
+"""
+        _, block_map = _tag_blocks(content)
+        blocks = list(block_map.values())
+
+        assert len(blocks) == 2
+        assert any("## Catalysts" in block and "- Agentforce" in block for block in blocks)
+        assert any("## Metrics" in block and "| Revenue growth | 12% |" in block for block in blocks)
+
 
 class TestVaultWriter:
     def test_write_creates_file(self, vault_dir):
@@ -81,6 +113,32 @@ class TestVaultWriter:
         assert path1 != path2
         assert path1.exists()
         assert path2.exists()
+
+    def test_write_pillar_dossier(self, vault_dir):
+        writer = VaultWriter(root=vault_dir)
+        path = writer.write_pillar_dossier(
+            ticker="CRM",
+            pillar_id="CRM-growth-abc123",
+            pillar_type="growth",
+            status="weakened",
+            version=2,
+            statement="Revenue growth remains durable but slower.",
+            rationale="Growth slowed from prior assumptions.",
+            valuation_impact="Lowers terminal growth.",
+            source_urls=["https://example.com/earnings"],
+            evidence_citations=["file.md#^block123"],
+            current_memory_id="550e8400-e29b-41d4-a716-446655440000",
+            statement_hash="abc123",
+            lifecycle_event="weakened",
+            lifecycle_reason="Fresh evidence lowered confidence.",
+        )
+
+        assert path == vault_dir / "CRM" / "pillars" / "CRM-growth-abc123.md"
+        text = path.read_text(encoding="utf-8")
+        assert "source_type: thesis_pillar_dossier" in text
+        assert "Revenue growth remains durable" in text
+        assert "https://example.com/earnings" in text
+        assert "weakened: Fresh evidence lowered confidence" in text
 
 
 class TestVaultReader:

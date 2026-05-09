@@ -5,6 +5,7 @@ from schemas import AgentNode
 from provider import DateTimeProvider, FinancialDataProvider
 from utils.logger import get_logger, log_node_execution
 from utils.report_writer import RunReportWriter
+from utils import vector_memory
 from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
 from utils.config import supervisor_model
 
@@ -82,6 +83,7 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
                     content=fundamentals_md,
                     source_type="fundamentals",
                     source_priority=2,
+                    vectorize=False,
                     metadata={
                         "url": "alphavantage+yfinance",
                         "sentiment": "neutral",
@@ -94,7 +96,30 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
                     updates["active_memory_ids"] = memory_ids_from_artifact(artifact)
             except Exception as e:
                 logger.warning(f"[Supervisor] ⚠️ Failed to write vault entry: {e}")
-    
+
+    # ── RAG retrieval: pull active thesis pillars for this ticker ──
+    if not state.get("rag_context") and not state.get("retrieved_memory_ids"):
+        try:
+            result = await vector_memory.retrieve_active_pillars(
+                ticker=state["ticker"],
+            )
+            updates["rag_context"] = result.get("memory_context", "")
+            updates["retrieved_memory_ids"] = result.get("retrieved_memory_ids", [])
+            updates["research_topics"] = result.get("topics", [])
+            pillar_count = len(result.get("retrieved_memory_ids", []))
+            if pillar_count:
+                logger.info(
+                    "[Supervisor] 🔍 Retrieved %d active thesis pillars for %s",
+                    pillar_count, state["ticker"],
+                )
+            else:
+                logger.info(
+                    "[Supervisor] No active pillars for %s — pillar cold start",
+                    state["ticker"],
+                )
+        except Exception as e:
+            logger.warning("[Supervisor] ⚠️ Pillar retrieval failed, continuing: %s", e)
+
     bull_done = state.get('bull_thesis')
     bear_done = state.get('bear_thesis')
 

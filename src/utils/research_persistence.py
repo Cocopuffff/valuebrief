@@ -10,7 +10,9 @@ metadata so reports can cite the local Markdown blocks.
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional, Union
 
@@ -24,9 +26,84 @@ logger = get_logger(__name__)
 
 EmbeddingFn = Callable[[list[str]], Awaitable[list[list[float]]]]
 StoreFn = Callable[[list[InsightRecord]], Awaitable[list[str]]]
+SummaryFn = Callable[[list[str]], Awaitable[list[str]]]
+SUMMARY_VERSION = "rag-summary-v1"
 
 # Accept either a VaultArtifact instance or a serialised dict (from LangGraph state).
 _ArtifactLike = Union[VaultArtifact, dict[str, Any]]
+
+
+def _coerce_llm_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def _truncate_words(text: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0].rstrip()
+    return clipped
+
+
+def _fallback_summary(text: str, max_chars: int = 320) -> str:
+    lines = [
+        line.strip()
+        for line in str(text or "").splitlines()
+        if line.strip() and not re.match(r"^#{1,6}\s+\S", line.strip())
+    ]
+    clean = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if not clean:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    candidate = " ".join(sentences[:2]).strip() if sentences else clean
+    return _truncate_words(candidate or clean, max_chars)
+
+
+async def _summarize_one_chunk(text: str) -> str:
+    prompt = (
+        "Summarize this investment research source chunk in 1-2 concise "
+        "sentences. Capture the most decision-relevant facts, claims, numbers, "
+        "or risks. Do not quote or copy formatting. Keep it under 320 "
+        f"characters.\n\nSOURCE CHUNK:\n{text[:4000]}"
+    )
+    from utils.config import curator_model
+
+    response = await curator_model.ainvoke(prompt)
+    return _truncate_words(_coerce_llm_text(response.content), 320)
+
+
+async def summarize_insight_chunks(texts: list[str]) -> list[str]:
+    """Generate concise summaries for source chunks, with extractive fallback."""
+    if not texts:
+        return []
+
+    semaphore = asyncio.Semaphore(6)
+
+    async def guarded(text: str) -> str:
+        try:
+            async with semaphore:
+                summary = await _summarize_one_chunk(text)
+            return summary or _fallback_summary(text)
+        except Exception as e:
+            logger.warning("[Persistence] Summary generation failed: %s", e)
+            return _fallback_summary(text)
+
+    return await asyncio.gather(*(guarded(text) for text in texts))
 
 
 async def persist_research_artifact(
@@ -36,11 +113,18 @@ async def persist_research_artifact(
     source_type: str,
     metadata: Optional[dict[str, Any]] = None,
     source_priority: int = 1,
+    vectorize: bool = True,
     vault_root: Optional[pathlib.Path] = None,
     embedding_fn: EmbeddingFn = get_embeddings,
     store_fn: StoreFn = batch_store_insights,
+    summary_fn: SummaryFn = summarize_insight_chunks,
 ) -> VaultArtifact:
-    """Persist one research artifact to the vault and vector memory.
+    """Persist one research artifact to the vault and optionally vector memory.
+
+    When ``vectorize=False``, only the vault file is written — no embeddings are
+    generated and no vectors are inserted.  Use this for artifacts that should
+    remain in the vault audit trail but not become normal retrieval memories
+    (e.g. raw thesis texts, fundamentals snapshots, judge analysis).
 
     Returns a VaultArtifact Pydantic model.  Callers should serialise with
     ``artifact.model_dump(mode="json")`` before storing in LangGraph state.
@@ -74,13 +158,29 @@ async def persist_research_artifact(
     block_memory_ids: dict[str, str] = {}
     vector_error = ""
 
-    if doc.block_map:
+    if vectorize and doc.block_map:
         try:
             block_items = list(doc.block_map.items())
-            embeddings = await embedding_fn([text for _, text in block_items])
+            source_texts = [text for _, text in block_items]
+            embeddings = await embedding_fn(source_texts)
+            try:
+                summaries = await summary_fn(source_texts)
+            except Exception as e:
+                logger.warning(
+                    "[Persistence] Summary generation failed for %s/%s: %s",
+                    ticker,
+                    doc.source_type,
+                    e,
+                )
+                summaries = [_fallback_summary(text) for text in source_texts]
+            if len(summaries) != len(source_texts):
+                summaries = [
+                    summaries[i] if i < len(summaries) and summaries[i] else _fallback_summary(text)
+                    for i, text in enumerate(source_texts)
+                ]
 
             insights: list[InsightRecord] = []
-            for (block_id, text), embedding in zip(block_items, embeddings):
+            for i, ((block_id, text), embedding) in enumerate(zip(block_items, embeddings)):
                 insight_metadata = {
                     **metadata,
                     "type": "vault_artifact",
@@ -91,11 +191,17 @@ async def persist_research_artifact(
                     "block_id": block_id,
                     "citation": f"{pathlib.Path(path).name}#^{block_id}",
                     "content_hash": doc.content_hash,
+                    "embedding_source": "vault_block",
+                    "summary_version": SUMMARY_VERSION,
+                    "source_chars": len(text),
                 }
                 insights.append(
                     InsightRecord(
                         ticker=ticker,
-                        summary=text,
+                        summary=_truncate_words(
+                            summaries[i] or _fallback_summary(text),
+                            320,
+                        ),
                         embedding=embedding,
                         metadata=insight_metadata,
                         source_priority=source_priority,

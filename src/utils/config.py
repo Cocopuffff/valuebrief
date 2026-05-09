@@ -96,7 +96,7 @@ def get_llm(config: AgentConfig):
             return ChatDeepSeekThinking(
                 model=config.model,
                 temperature=config.temperature,
-                model_kwargs={"extra_body": {"thinking": {"type": "enabled"}}},
+                extra_body={"thinking": {"type": "enabled"}},
             )
         from langchain_deepseek import ChatDeepSeek
         return ChatDeepSeek(model=config.model, temperature=config.temperature)

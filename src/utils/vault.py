@@ -26,6 +26,13 @@ from schemas import VaultDocument
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+MAX_BLOCK_CHARS = 2500
+_BLOCK_ID_PATTERN = re.compile(
+    r"(?:^|[ \t])\^(block-[a-f0-9]{8})(?=\s*(?:\n\n|$))",
+    re.MULTILINE,
+)
+_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+\S")
+_RULE_PATTERN = re.compile(r"\s*[-*_]{3,}\s*")
 
 VAULT_ROOT = pathlib.Path(
     os.getenv("VAULT_PATH",
@@ -45,19 +52,150 @@ def _short_uuid() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _is_heading(line: str) -> bool:
+    return bool(_HEADING_PATTERN.match(line.strip()))
+
+
+def _heading_level(line: str) -> int:
+    match = _HEADING_PATTERN.match(line.strip())
+    return len(match.group(1)) if match else 0
+
+
+def _split_markdown_blocks(content: str) -> list[str]:
+    """Split Markdown into logical blocks while preserving fenced code blocks."""
+    blocks: list[str] = []
+    current: list[str] = []
+    in_fence = False
+    fence_marker = ""
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            current.append(line)
+            continue
+
+        if not in_fence and not stripped:
+            if current:
+                blocks.append("\n".join(current).strip())
+                current = []
+            continue
+
+        current.append(line)
+
+    if current:
+        blocks.append("\n".join(current).strip())
+
+    return [block for block in blocks if block]
+
+
+def _apply_heading_context(content: str, headings: list[str]) -> str:
+    if not headings:
+        return content.strip()
+    return "\n".join(headings).strip() + "\n\n" + content.strip()
+
+
+def _cap_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0].rstrip()
+    return clipped
+
+
+def _split_oversized_chunk(content: str, headings: list[str]) -> list[str]:
+    """Split a chunk on paragraph boundaries, hard-capping each emitted block."""
+    with_context = _apply_heading_context(content, headings)
+    if len(with_context) <= MAX_BLOCK_CHARS:
+        return [with_context]
+
+    max_body_chars = MAX_BLOCK_CHARS
+    prefix = ""
+    if headings:
+        prefix = "\n".join(headings).strip() + "\n\n"
+        max_body_chars = max(200, MAX_BLOCK_CHARS - len(prefix))
+
+    parts = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    def emit(body: str) -> None:
+        if not body.strip():
+            return
+        if len(body) <= max_body_chars:
+            chunks.append((prefix + body.strip()).strip())
+            return
+        remaining = body.strip()
+        while remaining:
+            piece = _cap_text(remaining, max_body_chars)
+            if not piece:
+                piece = remaining[:max_body_chars]
+            chunks.append((prefix + piece).strip())
+            remaining = remaining[len(piece):].strip()
+
+    for part in parts:
+        candidate = f"{current}\n\n{part}".strip() if current else part
+        if len(candidate) <= max_body_chars:
+            current = candidate
+            continue
+        emit(current)
+        current = ""
+        emit(part)
+
+    emit(current)
+    return chunks
+
+
 def _tag_blocks(content: str) -> tuple[str, dict[str, str]]:
-    """Split content into paragraphs and append a unique block ID to each.
+    """Split Markdown into source chunks and append a unique block ID to each.
 
     Returns the tagged content string and a {block_id: paragraph_text} map.
     """
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+    markdown_blocks = _split_markdown_blocks(content)
     tagged_parts: list[str] = []
     block_map: dict[str, str] = {}
+    heading_stack: list[tuple[int, str]] = []
 
-    for para in paragraphs:
-        block_id = f"block-{_short_uuid()}"
-        tagged_parts.append(f"{para} ^{block_id}")
-        block_map[block_id] = para
+    for block in markdown_blocks:
+        lines = block.splitlines()
+        content_lines: list[str] = []
+
+        for line in lines:
+            if not content_lines and _is_heading(line):
+                level = _heading_level(line)
+                heading_stack = [
+                    (existing_level, text)
+                    for existing_level, text in heading_stack
+                    if existing_level < level
+                ]
+                heading_stack.append((level, line.strip()))
+                continue
+            content_lines.append(line)
+
+        content_block = "\n".join(content_lines).strip()
+        if not content_block:
+            continue
+        # Skip blocks whose only "content" is horizontal rules (---, ***, ___).
+        substantive_lines = [
+            line for line in content_block.splitlines()
+            if line.strip() and not _RULE_PATTERN.fullmatch(line.strip())
+        ]
+        if not substantive_lines:
+            continue
+
+        headings = [text for _, text in heading_stack]
+        for chunk in _split_oversized_chunk(content_block, headings):
+            block_id = f"block-{_short_uuid()}"
+            tagged_parts.append(f"{chunk} ^{block_id}")
+            block_map[block_id] = chunk
 
     return "\n\n".join(tagged_parts), block_map
 
@@ -86,15 +224,14 @@ def _extract_block_map(body: str) -> dict[str, str]:
     Block IDs look like: ... ^block-abcd1234
     """
     block_map: dict[str, str] = {}
-    pattern = re.compile(r"\^(block-[a-f0-9]{8})")
+    start = 0
 
-    for paragraph in body.split("\n\n"):
-        match = pattern.search(paragraph)
-        if match:
-            block_id = match.group(1)
-            # Remove the block ID tag to get clean paragraph text
-            clean = pattern.sub("", paragraph).strip()
+    for match in _BLOCK_ID_PATTERN.finditer(body):
+        block_id = match.group(1)
+        clean = body[start:match.start()].strip()
+        if clean:
             block_map[block_id] = clean
+        start = match.end()
 
     return block_map
 
@@ -225,6 +362,96 @@ class VaultWriter:
         file_path = ticker_dir / f"{month}_synthesis.md"
         file_path.write_text(file_content, encoding="utf-8")
         logger.info(f"[Vault] 📁 Synthesis written: {file_path} ({len(block_map)} blocks)")
+        return file_path
+
+    def write_pillar_dossier(
+        self,
+        *,
+        ticker: str,
+        pillar_id: str,
+        pillar_type: str,
+        status: str,
+        version: int,
+        statement: str,
+        rationale: str = "",
+        valuation_impact: str = "",
+        source_urls: Optional[list[str]] = None,
+        evidence_citations: Optional[list[str]] = None,
+        current_memory_id: str = "",
+        statement_hash: str = "",
+        lifecycle_event: str = "supported",
+        lifecycle_reason: str = "",
+        resurrection_reason: str = "",
+        merged_into_pillar_id: str = "",
+    ) -> pathlib.Path:
+        """Create or update the full local audit dossier for a thesis pillar."""
+        ticker = ticker.upper()
+        source_urls = source_urls or []
+        evidence_citations = evidence_citations or []
+
+        ticker_dir = self.root / ticker / "pillars"
+        ticker_dir.mkdir(parents=True, exist_ok=True)
+        file_path = ticker_dir / f"{pillar_id}.md"
+
+        existing_history = ""
+        if file_path.exists():
+            try:
+                _, old_body = _parse_frontmatter(file_path.read_text(encoding="utf-8"))
+                marker = "## Lifecycle History"
+                if marker in old_body:
+                    existing_history = old_body.split(marker, 1)[1].strip()
+            except Exception as e:
+                logger.debug("[Vault] Failed to read existing pillar dossier %s: %s", file_path, e)
+
+        history_line = (
+            f"- {date.today().isoformat()} | {lifecycle_event}: "
+            f"{lifecycle_reason or 'No additional rationale provided.'}"
+        )
+        if resurrection_reason:
+            history_line += f" Resurrection rationale: {resurrection_reason}"
+        if merged_into_pillar_id:
+            history_line += f" Merged into: {merged_into_pillar_id}"
+
+        history_lines = [history_line]
+        if existing_history:
+            history_lines.append(existing_history)
+
+        def list_block(items: list[str]) -> str:
+            if not items:
+                return "- None recorded."
+            return "\n".join(f"- {item}" for item in items)
+
+        body = (
+            f"# {pillar_id}\n\n"
+            f"## Current Statement\n\n{statement or 'None recorded.'}\n\n"
+            f"## Rationale\n\n{rationale or 'None recorded.'}\n\n"
+            f"## Valuation Impact\n\n{valuation_impact or 'None recorded.'}\n\n"
+            f"## Source URLs\n\n{list_block(source_urls)}\n\n"
+            f"## Vault Citations\n\n{list_block(evidence_citations)}\n\n"
+            f"## Supersession Chain\n\n"
+            f"- Current memory ID: {current_memory_id or 'pending'}\n"
+            f"- Version: {version}\n"
+            f"- Merged into pillar ID: {merged_into_pillar_id or 'none'}\n\n"
+            f"## Lifecycle History\n\n"
+            + "\n".join(history_lines)
+            + "\n"
+        )
+
+        frontmatter = {
+            "source_type": "thesis_pillar_dossier",
+            "ticker": ticker,
+            "pillar_id": pillar_id,
+            "pillar_type": pillar_type,
+            "status": status,
+            "version": version,
+            "current_memory_id": current_memory_id,
+            "statement_hash": statement_hash,
+            "date_scraped": date.today().isoformat(),
+            "archived": False,
+        }
+        fm_str = yaml.dump(frontmatter, default_flow_style=False, sort_keys=False)
+        file_path.write_text(f"---\n{fm_str}---\n\n{body}", encoding="utf-8")
+        logger.info("[Vault] 🏛️ Pillar dossier written: %s", file_path)
         return file_path
 
 
