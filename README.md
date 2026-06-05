@@ -8,78 +8,92 @@ Value Brief: Covering your assets. An automated daily digest that accumulates in
 
 **The Solution:** Value Brief is an automated daily digest that acts as a personal team of investment analysts. By bridging the gap between generative AI and deterministic financial modeling, it translates complex, time-intensive research workflows into a streamlined pipeline that delivers actionable, fundamental-driven investment theses.
 
-## Architecture
+## Agent Architecture
 
-Value Brief is powered by an agentic research workflow orchestrated by LangGraph. It relies on specialised AI agents that operate iteratively and securely maintain state using Supabase PostgreSQL as a checkpointer.
+Value Brief is powered by a LangGraph workflow with durable Supabase PostgreSQL checkpointing. The current production path uses one bounded neutral Deep Agents research run per ticker, then hands the evidence to valuation, reporting, and memory-curation stages.
 
-- **Supervisor**: Controls workflow routing, validates inputs, fetches financial data, and runs a multi-probe RAG retrieval against prior research memories before dispatching to analysts. Retrieved memories serve as testable hypotheses, not accepted facts.
-- **Bull Analyst**: Operates standalone with recursive web scraping and research tooling to synthesise growth catalysts, competitive moats, and upside cases. Can search prior vector memories via `search_investment_memory` and gather fresh evidence against prior pillars.
-- **Bear Analyst**: Utilizes matching toolsets independently to extract short theses, highlight speculative risks, downside scenarios, and mapping margin issues. Identically capable of searching prior memories and gathering current challenge evidence.
-- **Judge Analyst**: Synthesizes conflicting fundamental researches, leverages a configured `ValuationModel` to execute a multi-stage Discounted Cash Flow (DCF), and assigns pillar outcomes: supported, weakened, revised, contradicted, or stale. Weighs probability models (Bear/Base/Bull), terminal value limits, and produces a reconciled final decision based strictly on margin of safety.
-- **Report Generator**: Reconciles the output into isolated Markdown timelines (with segmented debug graphs vs presentation-ready final structures). Builds citation manifests and upserts valuations to Supabase.
-- **Curator**: Post-run knowledge maintenance agent. Manages the hybrid RAG lifecycle with outcome-aware citation logic — only `supported`/`weakened` memories get `is_cited=true` (survival signal); `contradicted`/`stale` memories are demoted with a `validity_status` that excludes them from future retrieval. Also prunes stale vectors, consolidates old vault files into monthly syntheses, tracks thesis drift, deduplicates content, and monitors vector storage health.
+- **Supervisor**: Validates ticker inputs, fetches market and fundamental data, writes a fundamentals snapshot to the vault, retrieves active prior thesis pillars, loads source inventory from the vault, and creates one synthetic `deep_agent_research` task when fresh research is needed.
+- **Neutral Research Analyst (Deep Agents)**: Runs a single Deep Agents session per ticker. Deep Agents owns internal planning through its todo list while the application provides the research goal, required deliverables, project skills, tools, budgets, timeout, and output contract.
+  - **Research Tools**: The research agent can fetch SEC filings, discover earnings-call transcripts, search news and the web, scrape high-value pages, and search prior investment memories. Tool calls are bounded by `RESEARCH_MAX_TOOL_CALLS`, `RESEARCH_MAX_SEARCH_CALLS`, and `RESEARCH_MAX_SCRAPE_CALLS`.
+  - **Output Validation**: Research must return a `ResearchFindingBundle` with multiple cited findings, a structured source inventory when relevant, and a synthesis section containing `Candidate Investment Pillars`. Invalid output is retried once, then converted into a blocked finding for improvement.
+- **Judge Analyst**: Consumes research findings and synthesis, produces qualitative synthesis, derives a three-scenario DCF with `ValuationModel`, reconciles the thesis, and creates current thesis pillar candidates plus outcomes for prior pillars.
+- **Report Generator**: Writes final and debug Markdown reports, persists the final report to the vault, builds a citation manifest from vault block references, and upserts the latest valuation to Supabase.
+- **Curator**: Owns post-run memory maintenance. It persists new or revised thesis pillars, updates prior pillar lifecycles, consolidates near-duplicates, prunes stale non-pillar vectors, tracks thesis drift, deduplicates vault files, creates monthly syntheses, and monitors vector storage pressure.
 
-### Visualisation
+The older Bull and Bear analyst subgraphs still exist in `src/agents/orchestration.py` as reusable side-analyst components, but `build_research_workflow()` currently wires the neutral Deep Agents research path.
+
+### Workflow Visualisation
 
 ```mermaid
-%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 34, "rankSpacing": 42}} }%%
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 28, "rankSpacing": 44}} }%%
 flowchart LR
-    subgraph WORKFLOW["Agent Workflow"]
+    subgraph FLOW[" "]
         direction TB
-        S[Supervisor<br/>Validates inputs, fetches financial data<br/>Runs RAG retrieval, routes workflow<br/>Seeds vault with fundamentals]
 
-        subgraph ANALYSIS["Independent Analysis"]
+        subgraph AGENTS["Multi-Agent LangGraph Workflow"]
             direction LR
-            BA[Bull Analyst<br/>Recursive scraping and synthesis<br/>Growth catalysts, moats, upside<br/>Gathers current pillar evidence]
-            BE[Bear Analyst<br/>Recursive scraping and synthesis<br/>Short theses, risks, downside<br/>Gathers current challenge evidence]
+
+            subgraph A1["1. Supervisor"]
+                direction TB
+                S[- Price/Fundamentals<br/>- Active pillar retrieval<br/>- Source inventory<br/>- Single research task]
+            end
+
+            subgraph A2["2. Neutral Research Analyst"]
+                direction TB
+                RA[Deep Agents run<br/>- To-Dos planning<br/>- Bounded tools and timeout<br/>- ResearchFindingBundle validation]
+                SK[Project skills<br/>- SEC filings<br/>- Earnings Transcripts<br/>- Citation Quality<br/>- Value Investing Research]
+                T[Bounded tools<br/>- SEC filings<br/>- Earnings transcripts<br/>- News/search<br/>- Scrape website<br/>- Search memory]
+                VLD[Semantic validation<br/>- Summary + key points<br/>- Source URLs/citations<br/>- Source inventory<br/>- Candidate pillars section]
+                SK -.-> RA
+                RA -.-> T
+                T -.-> VLD
+            end
+
+            subgraph A3["3. Judge Analyst"]
+                direction TB
+                J[- Research synthesis<br/>- Three-scenario DCF<br/>- Final thesis<br/>- Pillar candidates and outcomes]
+            end
+
+            subgraph A4["4. Report Generator"]
+                direction TB
+                R[- Final and debug Markdown<br/>- Citation manifest<br/>- Valuation upsert]
+            end
+
+            subgraph A5["5. Curator"]
+                direction TB
+                C[- Investment pillar lifecycle<br/>- Dedupe and pruning<br/>- Monthly synthesis<br/>- Storage health]
+            end
+
+            A1 -->|research task| A2
+            A2 -->|findings + synthesis| A3
+            A3 --> A4
+            A4 --> A5
         end
-
-        subgraph TOOLS["Research Tools (available to Analysts)"]
-            direction LR
-            WS[Web Search]
-            PW[Parse Website]
-            NS[News Search<br/>Last day]
-            SM[Search Memory<br/>Prior vector research]
-        end
-
-        subgraph VALUATION["Valuation and Reconciliation"]
-            direction TB
-            J[Judge Analyst<br/>Synthesizes conflicting research<br/>Executes multi-stage DCF<br/>Weighs probability models<br/>Parses Memory Outcome labels]
-            VM[ValuationModel<br/>Two-stage 10-year DCF<br/>Gordon Growth terminal value]
-            J <-->|DCF assumptions and results| VM
-        end
-
-        R[Report Generator<br/>Assembles final + debug reports<br/>Builds citation manifest<br/>Upserts valuation to DB]
-        C[Curator<br/>Pillar lifecycle maintenance<br/>supported/weakened → active<br/>revised → superseded replacement<br/>contradicted/stale → inactive<br/>Thesis drift tracking<br/>Vault consolidation and pruning]
-        AVYF[Alpha Vantage and yfinance<br/>direct router call]
-        DONE[Final Output]
-
-        S --> ANALYSIS
-        ANALYSIS -.->|uses| TOOLS
-        ANALYSIS --> VALUATION
-        VALUATION --> R
-        R --> C
-        C --> DONE
-        S -.-> AVYF
     end
 
     subgraph PERSIST["Persistence Layer"]
         direction TB
-        V[Local Vault<br/>Markdown cold store<br/>Daily research documents<br/>Monthly syntheses<br/>Block-level citation IDs]
-
+        VAULT[(Local vault<br/>data/vault/TICKER<br/>block-level citations)]
         subgraph PG["Supabase PostgreSQL"]
-            direction TB
-            DB[(Non-vector Tables<br/>LangGraph checkpointer<br/>valuations<br/>investment_pillars<br/>thesis_drifts)]
-            VMEM[(Vector Memory<br/>investment_memories + pgvector<br/>Semantic similarity search<br/>validity_status tracking<br/>Priority-tiered insights)]
+            direction LR
+            CP[(LangGraph checkpoints)]
+            MEM[(investment_memories<br/>pgvector hot memory)]
+            PILLARS[(investment_pillars<br/>stable pillar registry)]
+            VAL[(valuations<br/>thesis_drifts)]
         end
     end
 
-    WORKFLOW -->|RAG retrieval, vault writes,<br/>valuation upserts, curation maintenance| PERSIST
+    FLOW -->|state, reports, vectors,<br/>pillars, valuations, drift| PERSIST
+    style FLOW fill:none,stroke:none,color:transparent
 
     classDef workflow fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#111827
     classDef store fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#0f172a
-    class S,BA,BE,WS,PW,NS,SM,J,VM,R,C,AVYF,DONE workflow
-    class V,DB,VMEM store
+    classDef runtime fill:#eef6ff,stroke:#60a5fa,stroke-width:1px,color:#0f172a
+    classDef external fill:#f7fee7,stroke:#84cc16,stroke-width:1px,color:#0f172a
+    class S,RA,J,R,C,START,DONE workflow
+    class SK,T,VLD runtime
+    class FD,SEC,WEB external
+    class CP,VAULT,MEM,PILLARS,VAL store
 ```
 
 ## Sample Output Report
@@ -122,153 +136,183 @@ flowchart LR
 
 ---
 
-## Hybrid RAG: Insight Lifecycle Management
+## Insight Lifecycle Management
 
-Value Brief maintains a pillar-first knowledge store that grows smarter with each run. Fresh research is written to a **local Markdown vault** for full audit history, while Supabase stores pillar identity, lifecycle state, and compact vector-search rows. The Curator agent manages creation, revision, consolidation, pruning, and drift tracking so the system self-maintains and avoids bloat.
+Value Brief maintains a pillar-first knowledge store that grows smarter with each run. Fresh research is written to a **local Markdown vault** for auditability and citation, while Supabase stores workflow checkpoints, valuation history, stable pillar identity, and compact vector-search rows. Research findings can be embedded as short-lived evidence, but the durable retrieval unit is the curated thesis pillar.
 
-### Storage Architecture
+### Memory Architecture
 
-| Layer                   | Storage                                                                                    | Purpose                                                                                                         | Retention                                              |
-| :---------------------- | :----------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------- |
-| **Vault** (cold)        | `data/vault/{TICKER}/` plus `data/vault/{TICKER}/pillars/{pillar_id}.md`                  | Complete auditable record of research documents, source URLs, pillar dossiers, revision history, and citations | Indefinite (deduplicated by content hash)              |
-| **Pillar Registry**     | `investment_pillars` table                                                               | Stable pillar identity, lifecycle status, current vector pointer, and dossier link                              | Current and historical pillar identities               |
-| **Vector Memory** (hot) | `investment_memories` table — 1536-dim pgvector embeddings via `text-embedding-3-small`   | Compact semantic search rows for current pillars, drift checks, and summary consolidation                       | Actively pruned; compact rows only                     |
+| Layer                          | Storage                                                                                 | Purpose                                                                                                        | Retention / Lifecycle                                      |
+| :----------------------------- | :-------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------- |
+| **Workflow Checkpoints**       | LangGraph checkpoint tables in Supabase PostgreSQL                                      | Durable run state, resume support, and crash recovery                                                          | Managed by `AsyncPostgresSaver.setup()`                    |
+| **Vault** (cold)               | `data/vault/{TICKER}/`                                                                  | Full Markdown audit trail for fundamentals, research findings, judge analysis, final reports, and source URLs  | Indefinite, content-hash deduplicated, old files archived  |
+| **Pillar Dossiers**            | `data/vault/{TICKER}/pillars/{pillar_id}.md`                                            | Human-readable lifecycle record for each durable thesis pillar                                                 | Historical dossier retained even when pillar is inactive   |
+| **Vector Memory** (hot)        | `investment_memories` with 1536-dim embeddings from `text-embedding-3-small` by default | Semantic retrieval for active thesis pillars, temporary research evidence, monthly summaries, historical summaries | Actively pruned and compressed                             |
+| **Pillar Registry**            | `investment_pillars`                                                                    | Stable pillar identity, status, current vector pointer, version, and dossier citation                          | Current and historical pillar identities                   |
+| **Valuation and Drift History** | `valuations`, `thesis_drifts`                                                           | Latest DCF valuation, prior thesis context, and run-over-run verdict/value changes                             | One latest valuation per ticker plus drift event history   |
+| **SEC Lookup Cache**           | SEC company ticker table from `scripts/04-sec_company_tickers_ddl.sql`                  | Fast CIK lookup for filing retrieval                                                                           | Refreshable reference data                                 |
 
-Apply `scripts/03-investment_pillars_ddl.sql` and then run `scripts/backfill_pillar_dossiers.py` to migrate existing thesis-pillar memories into the pillar registry and local dossier files.
+Apply `scripts/01-investment_memories_ddl.sql` for vector memory, `scripts/03-investment_pillars_ddl.sql` for pillar identity, and `scripts/04-sec_company_tickers_ddl.sql` for SEC ticker lookup support.
 
-### Lifecycle Stages
+### Memory Visualisation
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 24, "rankSpacing": 28}} }%%
 flowchart LR
-    subgraph LIFE["Insight Lifecycle"]
+    subgraph RUN["Per-Ticker Run"]
         direction TB
 
-        subgraph STEP0["0. Retrieval (per run)"]
+        subgraph STEP1["1. Supervisor Context"]
             direction LR
             S[Supervisor]
-            PROBES[Multi-probe<br/>semantic search]
-            PRIOR[Prior memories]
-            S --> PROBES --> PRIOR
+            F[Fundamentals snapshot]
+            INV[Source inventory<br/>from vault metadata]
+            PRIOR[Active prior pillars<br/>supported/weakened]
+            S --> F
+            S --> INV
+            S --> PRIOR
         end
 
-        subgraph STEP1["1. Creation (per run)"]
+        subgraph STEP2["2. Neutral Research"]
             direction LR
-            ANALYSTS[Analysts]
-            OUTCOMES[Memory Outcomes<br/>supported/weakened/revised/<br/>contradicted/superseded/stale]
-            ANALYSTS --> OUTCOMES
+            DA[Deep Agents<br/>internal todos]
+            BUDGET[Tool budget<br/>timeout<br/>one retry]
+            FIND[ResearchFindingBundle<br/>multiple cited findings]
+            DA --> BUDGET --> FIND
         end
 
-        subgraph STEP2["2. Curation (per run)"]
+        subgraph STEP3["3. Judge"]
             direction LR
-            REP[Report Generator]
-            CM[Citation Manifest]
-            CUR[Curator]
-            REP --> CM --> CUR
+            SYN[Qualitative synthesis]
+            DCF[Three-scenario DCF]
+            PILLAR[Thesis pillars<br/>and prior outcomes]
+            SYN --> DCF --> PILLAR
         end
 
-        subgraph STEP3["3. Consolidation (monthly)"]
+        subgraph STEP4["4. Report"]
             direction LR
-            OLD[Vault files 90 days old]
-            GRP[Monthly Groups]
-            SYNTH[(Monthly Synthesis)]
-            OLD --> GRP --> SYNTH
+            REP[Final report]
+            CITE[Citation manifest<br/>vault block refs]
+            VAL[Valuation upsert]
+            REP --> CITE
+            REP --> VAL
         end
 
-        subgraph STEP4["4. Aggressive Pruning"]
+        subgraph STEP5["5. Curator"]
             direction LR
-            OLDEST[Oldest summary vectors]
-            HIST[(Historical Summary)]
-            OLDEST --> HIST
+            LIFE[Pillar lifecycle]
+            DEDUPE[Vault/pillar dedupe]
+            COMPRESS[Monthly and historical<br/>summary compression]
+            LIFE --> DEDUPE --> COMPRESS
         end
-
-        subgraph STEP5["5. Drift Tracking"]
-            direction LR
-            OLDV[Prior valuation]
-            NEWV[Current judge decision]
-            DRIFT[Delta Calculation]
-            OLDV --> DRIFT
-            NEWV --> DRIFT
-        end
-
-        subgraph STEP6["6. Deduplication"]
-            direction LR
-            DUP[Duplicate vault files]
-        end
-
-        STEP0 ~~~ STEP1
-        STEP1 ~~~ STEP2
-        STEP2 ~~~ STEP3
-        STEP3 ~~~ STEP4
-        STEP4 ~~~ STEP5
-        STEP5 ~~~ STEP6
     end
 
-    subgraph TOUCH["Persistence Touchpoints"]
+    subgraph STORES["Memory Stores"]
         direction TB
-        T0[0 read Vector Memory]
-        T1[1 write Local Vault<br/>and Vector Memory]
-        T2[2 update Vector Memory<br/>and valuations]
-        T3[3 archive Local Vault<br/>swap vectors to summary]
-        T4[4 merge old Vector Memory]
-        T5[5 read valuations<br/>record thesis_drifts]
-        T6[6 dedupe Local Vault]
-        T0 ~~~ T1
-        T1 ~~~ T2
-        T2 ~~~ T3
-        T3 ~~~ T4
-        T4 ~~~ T5
-        T5 ~~~ T6
+        VAULT[(Local Vault<br/>research docs<br/>source inventory metadata<br/>block IDs)]
+        DOSSIER[(Pillar Dossiers<br/>lifecycle history)]
+        VEC[(investment_memories<br/>pgvector hot memory)]
+        REG[(investment_pillars<br/>stable identity)]
+        VDB[(valuations<br/>thesis_drifts)]
     end
 
-    subgraph PERSIST["Persistence Layer"]
-        direction TB
-        VAULT[(Local Vault<br/>Markdown cold store<br/>research docs + monthly syntheses<br/>block-level citation IDs)]
+    F --> VAULT
+    INV --> DA
+    PRIOR --> DA
+    REG --> PRIOR
+    VEC --> PRIOR
+    FIND --> VAULT
+    FIND --> VEC
+    PILLAR --> REP
+    CITE --> LIFE
+    VAL --> VDB
+    LIFE --> VEC
+    LIFE --> REG
+    LIFE --> DOSSIER
+    DEDUPE --> VAULT
+    COMPRESS --> VAULT
+    COMPRESS --> VEC
 
-        subgraph PG["Supabase PostgreSQL"]
-            direction TB
-            VEC[(Vector Memory<br/>investment_memories + pgvector<br/>1536-dim embeddings<br/>validity_status)]
-            PGTABLES[(Non-vector Tables<br/>LangGraph checkpointer<br/>valuations<br/>investment_pillars<br/>thesis_drifts)]
-        end
-    end
-
-    LIFE --> TOUCH
-    TOUCH --> PERSIST
+    %% Arrow colours:
+    %% black=RUN process links, red=Pillar lifecycle to Memory Stores.
+    linkStyle 0 stroke:#111827,stroke-width:2px
+    linkStyle 1 stroke:#111827,stroke-width:2px
+    linkStyle 2 stroke:#111827,stroke-width:2px
+    linkStyle 3 stroke:#111827,stroke-width:2px
+    linkStyle 4 stroke:#111827,stroke-width:2px
+    linkStyle 5 stroke:#111827,stroke-width:2px
+    linkStyle 6 stroke:#111827,stroke-width:2px
+    linkStyle 7 stroke:#111827,stroke-width:2px
+    linkStyle 8 stroke:#111827,stroke-width:2px
+    linkStyle 9 stroke:#111827,stroke-width:2px
+    linkStyle 10 stroke:#111827,stroke-width:2px
+    linkStyle 12 stroke:#111827,stroke-width:2px
+    linkStyle 13 stroke:#111827,stroke-width:2px
+    linkStyle 18 stroke:#111827,stroke-width:2px
+    linkStyle 19 stroke:#111827,stroke-width:2px
+    linkStyle 16 stroke:#0891b2,stroke-width:2px
+    linkStyle 17 stroke:#0891b2,stroke-width:2px
+    linkStyle 20 stroke:#d97706,stroke-width:2px
+    linkStyle 21 stroke:#dc2626,stroke-width:2px
+    linkStyle 22 stroke:#dc2626,stroke-width:2px
+    linkStyle 23 stroke:#dc2626,stroke-width:2px
+    linkStyle 24 stroke:#8b5cf6,stroke-width:2px
+    linkStyle 25 stroke:#16a34a,stroke-width:2px
+    linkStyle 26 stroke:#16a34a,stroke-width:2px
 
     classDef store fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#0f172a
     classDef lifecycle fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#111827
-    classDef touch fill:#fff7ed,stroke:#f59e0b,stroke-width:1px,color:#111827
-    class VAULT,VEC,PGTABLES store
-    class S,PROBES,PRIOR,ANALYSTS,OUTCOMES,REP,CM,CUR,OLD,GRP,SYNTH,OLDEST,HIST,OLDV,NEWV,DRIFT,DUP lifecycle
-    class T0,T1,T2,T3,T4,T5,T6 touch
+    class VAULT,DOSSIER,VEC,REG,VDB store
+    class S,F,INV,PRIOR,DA,BUDGET,FIND,SYN,DCF,PILLAR,REP,CITE,VAL,LIFE,DEDUPE,COMPRESS lifecycle
 ```
 
-#### 0. Retrieval — Every Run (Before Research)
+### Lifecycle Stages
 
-Before dispatching to analysts, the Supervisor queries the vector store for **prior research memories** on the current ticker:
+#### 1. Supervisor Context — Every Run
 
-- Embeds five fixed semantic probes targeting moat/growth, risks, valuation assumptions, thesis drift, and prior valuation.
-- Merges results with a weighted scoring formula that rewards first-party, cited, and previously-supported memories.
-- Default retrieval **excludes** memories previously labeled `contradicted`, `superseded`, or `stale` — these no longer compete for analyst attention. The thesis-drift probe can optionally include them to explain how the thesis changed.
-- Retrieved memories are formatted into a structured `ResearchBrief` with inline vault citation strings and passed to analysts as **testable hypotheses**, not accepted facts.
+- The Supervisor fetches price/fundamental data via Alpha Vantage and yfinance.
+- A fundamentals snapshot is written to `data/vault/{TICKER}/`.
+- Source inventory is rebuilt from vault metadata and prior `source_inventory_records`.
+- Active prior pillars are retrieved through `retrieve_active_pillars()`, primarily via `investment_pillars.current_memory_id` joined to `investment_memories`.
+- Only `supported` and `weakened` pillars are normal retrieval candidates; `contradicted`, `superseded`, and `stale` pillars remain in history but are excluded from the default research context.
 
-#### 1. Creation — Every Run
+#### 2. Neutral Research — Every Run
 
-- **Supervisor** fetches financial data via Alpha Vantage / yfinance and writes a fundamentals snapshot to the vault (`VaultWriter`).
-- Analyst research findings (Bull + Bear) are written to the vault as timestamped, content-hashed Markdown documents.
-- Each paragraph in a vault document receives a block ID (`^block-xxxxxxxx`), enabling granular citation.
-- Insights are embedded via `text-embedding-3-small` (1536-dim) and stored in the `investment_memories` vector table with ticker-scoped metadata and a `source_priority` tier.
-- The Judge labels each prior pillar with an outcome: `supported`, `weakened`, `revised`, `contradicted`, or `stale`. Contradicted outcomes must cite newer evidence that refutes the prior pillar.
+- The Supervisor creates one `deep_agent_research` task. There is no outer queue of deterministic granular tasks.
+- Deep Agents receives the full research goal, prior pillar context, known source inventory, and required deliverables.
+- Project skills are seeded under `/skills/`, including SEC filings, earnings transcripts, citation quality, and value-investing research guidance.
+- Research tools share a per-run budget. Exhausted tools return a controlled "budget exhausted; synthesize now" message instead of allowing an unbounded search loop.
+- Output must parse as `ResearchFindingBundle`. Semantic validation requires non-empty summaries, key points, source URLs or vault citations, and structured source inventory for source-discovery findings.
+- Valid findings are persisted to the vault and vectorized as evidence rows. If the run times out or stays malformed after one retry, a blocked finding is persisted instead of a low-quality artifact.
 
-#### 2. Curation — Every Run
+#### 3. Judge Synthesis and Valuation
 
-After the report is generated, the **Curator** performs **outcome-aware** housekeeping:
+- The Judge synthesizes the neutral findings and research synthesis.
+- The valuation step asks for DCF assumptions only; `ValuationModel.compute_dcf()` calculates intrinsic values deterministically.
+- The reconcile step produces the final thesis text plus JSON for:
+  - `thesis_pillars`: current active pillar candidates.
+  - `pillar_outcomes`: lifecycle decisions for previously retrieved pillars.
+- Stable pillar IDs are assigned by the system and vector-memory layer, not by the research agent.
 
-1. **Citation Manifest**: Scans the final report for inline citation references (`(See: file.md#^block-id)`) and resolves each to its source paragraph in the vault.
-2. **Outcome-Gated Citation Marking**: The Judge extracts Memory Outcome labels from both analyst theses. Only `supported` and `weakened` memories remain active — this is a **survival signal**, not a "mentioned" flag. `contradicted`, `superseded`, and `stale` memories are demoted via a `validity_status` metadata field, which excludes them from future retrieval.
-3. **Delete Uncited Memories**: Vectors created within the active window (default 90 days) that were _not_ cited (and any with `validity_status = stale`) are deleted, preventing irrelevant embeddings from accumulating.
+#### 4. Report and Citation Manifest
 
-#### 3. Consolidation — Monthly
+- The Report Generator writes debug and final Markdown reports.
+- The final report is persisted to the vault with source URL metadata.
+- `build_citation_manifest()` resolves inline vault references such as `(See: file.md#^block-id)` so the Curator can connect report claims back to source paragraphs.
+- The latest valuation is upserted to Supabase for future prior-valuation context.
+
+#### 5. Curation — Every Run
+
+After the report is generated, the Curator performs outcome-aware memory maintenance:
+
+1. **Persist New/Revised Pillars**: Current thesis pillar candidates are embedded, written to pillar dossiers, inserted into `investment_memories` with `source_type = "thesis_pillar"`, and registered in `investment_pillars`.
+2. **Process Prior Outcomes**: `supported` pillars are marked cited; `weakened` pillars remain active but get `validity_status = "weakened"`; `revised` pillars are superseded once a replacement vector exists; `contradicted` and `stale` pillars are demoted out of normal retrieval.
+3. **Consolidate Duplicate Pillars**: Near-duplicate active pillars of the same type can be merged, with the duplicate marked `superseded` and its dossier updated.
+4. **Prune Non-Pillar Vectors**: Old uncited non-pillar memories are removed after the consolidation cutoff. Pillars are managed by lifecycle status rather than simple age.
+5. **Record Thesis Drift**: The latest judge decision and expected value are compared with prior valuation context and stored in `thesis_drifts`.
+6. **Deduplicate Vault Files**: Duplicate Markdown files with identical content hashes are removed, preserving the earliest file.
+
+#### 6. Consolidation — Monthly
 
 When vault files for a ticker exceed `CONSOLIDATION_CUTOFF_DAYS` (default 90 days), the Curator triggers consolidation:
 
@@ -279,41 +323,24 @@ When vault files for a ticker exceed `CONSOLIDATION_CUTOFF_DAYS` (default 90 day
 
 This ensures the vector index stays lean while preserving the full audit trail in cold storage.
 
-#### 4. Aggressive Pruning — On Storage Pressure
+#### 7. Summary Deduplication and Aggressive Pruning
 
-When the `investment_memories` table exceeds the aggressive threshold (default 80% of 500 MB):
-
-- The Curator identifies the oldest monthly summary vectors.
-- Merges them via the curator LLM into broader historical summaries.
-- Retains only the **3 most recent months** of summary vectors, deleting the rest.
-- This is an emergency mechanism — it only fires when storage approaches the configured `DB_LIMIT_MB`.
-
-#### 5. Thesis Drift Tracking
-
-Every run that produces a new valuation is compared against the **prior valuation** stored in Supabase:
-
-- Extracts the old and new verdicts (e.g., "Strong Buy" → "Buy").
-- Calculates the delta percentage between old and new probability-weighted expected values.
-- Extracts key risk changes from the judge's reconciliation output.
-- Records the drift as a row in the `thesis_drifts` table: `(ticker, old_verdict, new_verdict, old_ev, new_ev, delta_pct, key_changes)`.
-
-On a ticker's very first run, no prior valuation exists, so drift recording is skipped.
-
-#### 6. Deduplication
-
-The Curator scans the vault for files with identical SHA-256 content hashes. Within each duplicate group, the **earliest** file (by date in filename) is preserved and the rest are removed. This prevents redundant research documents from bloating the vault when the same URL is scraped across multiple runs.
+- Near-duplicate monthly and historical summary vectors are merged when they exceed the configured similarity threshold.
+- When the `investment_memories` table exceeds the aggressive threshold (default 80% of 500 MB), the Curator identifies older monthly summary vectors, merges them via the curator LLM into broader historical summaries, and retains only the **3 most recent months** of monthly summary vectors.
+- Aggressive pruning is an emergency mechanism; normal operation should rely on pillar lifecycle, non-pillar pruning, and monthly consolidation.
 
 ### Citation & Outcome System
 
-Value Brief uses a lightweight, file-based citation scheme combined with analyst-assigned outcome labels to maintain a self-correcting vector memory:
+Value Brief uses a lightweight file-based citation scheme combined with Judge-assigned pillar outcomes to maintain a self-correcting vector memory:
 
 - **In the vault**: Every paragraph in a Markdown document is tagged with a block ID: `^block-a1b2c3d4`.
 - **In the report**: Agents reference sources inline using the pattern `(See: 2026-05-02_a1b2c3d4.md#^block-a1b2c3d4)`.
-- **Memory Outcomes**: Each analyst assigns every retrieved prior memory one of four labels — `supported`, `weakened`, `revised`, `contradicted`, or `stale`. The Judge parses these blocks and merges conflicting labels conservatively (e.g., `contradicted` beats `supported`).
-- **At curation time**: the Curator keeps `supported` and `weakened` pillars active, turns revised prior rows into `superseded` rows with replacement pointers, and excludes `contradicted`, `superseded`, and `stale` pillars from normal retrieval without deleting the local dossier.
-- **Retrieval feedback loop**: Memories labeled `contradicted`, `superseded`, or `stale` are excluded by default from subsequent retrieval runs, so they stop competing for analyst attention. The thesis-drift probe can optionally surface them when explaining how the thesis changed over time.
+- **Research findings**: Deep Agents findings must carry source URLs or vault citations. Source-discovery findings must also include structured `SourceInventoryRecord` entries.
+- **Pillar outcomes**: The Judge assigns every retrieved prior pillar one of `supported`, `weakened`, `revised`, `contradicted`, or `stale`.
+- **At curation time**: The Curator keeps `supported` and `weakened` pillars active, turns revised prior rows into `superseded` rows once replacements exist, and excludes `contradicted`, `superseded`, and `stale` pillars from normal retrieval without deleting their local dossiers.
+- **Retrieval feedback loop**: Future runs retrieve active thesis pillars, not every historical paragraph vector. Old research evidence can still exist in the vault, while the hot retrieval surface stays compact and thesis-oriented.
 
-This creates a **provenance chain with outcome feedback**: report assertion → block ID → vault paragraph → vector embedding → analyst verdict → curation decision → future retrieval quality.
+This creates a **provenance chain with outcome feedback**: report assertion → block ID → vault paragraph → vector embedding → Judge outcome → curation decision → future retrieval quality.
 
 ## Getting Started
 
@@ -366,10 +393,14 @@ Edit `.env` with the following values:
 | `ALPHAVANTAGE_API_KEY`       | Alpha Vantage key for financial data                          |
 | `LANGSMITH_API_KEY`          | LangSmith key for tracing (optional but recommended)          |
 | `*_PROVIDER` / `*_MODEL`     | Per-agent LLM provider and model overrides                    |
+| `RESEARCH_TIMEOUT_SECONDS`   | Wall-clock timeout for the neutral Deep Agents research run   |
+| `RESEARCH_MAX_TOOL_CALLS`    | Total research tool-call budget per ticker                    |
+| `RESEARCH_MAX_SEARCH_CALLS`  | Search/news/transcript discovery budget per ticker            |
+| `RESEARCH_MAX_SCRAPE_CALLS`  | Web-scrape budget per ticker                                  |
 
-> **Tip:** Each agent (Bull, Bear, Judge, Supervisor, Report Generator, Valuation) has its own `_PROVIDER`, `_MODEL`, and `_TEMPERATURE` variable.
+> **Tip:** Each active agent role (Research, Judge, Supervisor, Report Generator, Valuation, Curator) has its own `_PROVIDER`, `_MODEL`, and `_TEMPERATURE` variable.
 >
-> Frontier models are strongly recommended for **Bull, Bear, and Judge analysts** for the best web search, reasoning, and tool calling capabilities. Success has been found using `qwen/qwen3.6-plus` with `0.2` temperature for excellent reasoning while remaining cost-effective.
+> Strong reasoning and reliable tool calling matter most for **Research** and **Judge**. DeepSeek thinking mode is supported through `deepseek-v4-pro` plus `RESEARCH_THINKING=true`; plain `deepseek-reasoner` is avoided for tool-using workflows because it does not support the forced `tool_choice` path used by some structured-output integrations.
 
 ### 4. Set up your portfolio
 
@@ -404,7 +435,15 @@ See `example-portfolio.json` for reference.
 
 ### 5. Initialise the database
 
-The checkpointer and valuation tables are created automatically on first run via `AsyncPostgresSaver.setup()`. Ensure your Supabase connection string points to a **transaction-pooler** endpoint (port `6543`) with `autocommit` enabled.
+The LangGraph checkpointer tables are created automatically on first run via `AsyncPostgresSaver.setup()`. Ensure your Supabase connection string points to a **transaction-pooler** endpoint (port `6543`) with `autocommit` enabled.
+
+Apply the repository DDL scripts for the RAG and lookup tables:
+
+```bash
+psql "$SUPABASE_CONNECTION_STRING" -f scripts/01-investment_memories_ddl.sql
+psql "$SUPABASE_CONNECTION_STRING" -f scripts/03-investment_pillars_ddl.sql
+psql "$SUPABASE_CONNECTION_STRING" -f scripts/04-sec_company_tickers_ddl.sql
+```
 
 ### 6. Run Value Brief
 

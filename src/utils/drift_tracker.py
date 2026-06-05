@@ -17,7 +17,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from schemas import DriftEntry
-from utils.db import get_pool
+from utils.db import get_pool, is_transient_db_error, run_db_operation
+from utils.db_outbox import append_db_outbox_entry
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,29 +62,55 @@ async def record_drift(
         delta_pct=delta_pct,
         key_changes=key_changes or [],
     )
+    payload = {
+        "ticker": ticker,
+        "old_verdict": old_verdict,
+        "new_verdict": new_verdict,
+        "old_expected_value": old_expected_value,
+        "new_expected_value": new_expected_value,
+        "delta_pct": delta_pct,
+        "key_changes": key_changes or [],
+    }
 
     try:
-        pool = await get_pool()
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO thesis_drifts
-                        (ticker, old_verdict, new_verdict, old_ev, new_ev, delta_pct, key_changes)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        ticker,
-                        old_verdict,
-                        new_verdict,
-                        old_expected_value,
-                        new_expected_value,
-                        delta_pct,
-                        Jsonb(key_changes or []),
-                    ),
-                )
+        async def insert() -> None:
+            pool = await get_pool()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO thesis_drifts
+                            (ticker, old_verdict, new_verdict, old_ev, new_ev, delta_pct, key_changes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            ticker,
+                            old_verdict,
+                            new_verdict,
+                            old_expected_value,
+                            new_expected_value,
+                            delta_pct,
+                            Jsonb(key_changes or []),
+                        ),
+                    )
+
+        await run_db_operation(insert, operation_name="record thesis drift")
     except Exception as e:
-        logger.error(f"[DriftTracker] Failed to record drift for {ticker}: {e}")
+        if is_transient_db_error(e):
+            await append_db_outbox_entry(
+                operation="insert",
+                table="thesis_drifts",
+                ticker=ticker,
+                payload=payload,
+                error=str(e),
+            )
+            logger.warning(
+                "[DriftTracker] Queued drift record for %s in local DB outbox after transient failure: %s",
+                ticker,
+                e,
+            )
+        else:
+            logger.error(f"[DriftTracker] Failed to record drift for {ticker}: {e}")
 
     logger.info(
         f"[DriftTracker] 📊 {ticker} drift recorded: "

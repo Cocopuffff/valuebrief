@@ -22,7 +22,8 @@ from typing import Any, Optional
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from utils.db import get_pool
+from utils.db import get_pool, is_transient_db_error, run_db_operation
+from utils.db_outbox import append_db_outbox_entry
 from utils.logger import get_logger
 from schemas.rag import InsightRecord, MemoryRecord
 
@@ -69,27 +70,50 @@ _PROBES: dict[str, str] = {
 
 async def store_insight(insight: InsightRecord) -> str:
     """Insert a single insight vector. Returns the generated UUID."""
-    pool = await get_pool()
     memory_id = str(uuid.uuid4())
+    payload = _insight_outbox_record(insight, memory_id)
 
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO investment_memories
-                    (id, embedding, summary, metadata, ticker, source_priority, is_cited)
-                VALUES (%s, %s::vector, %s, %s, %s, %s, %s)
-                """,
-                (
-                    memory_id,
-                    _vec_literal(insight.embedding),
-                    insight.summary,
-                    Jsonb(insight.metadata),
-                    insight.ticker.upper(),
-                    insight.source_priority,
-                    insight.is_cited,
-                ),
-            )
+    async def insert() -> None:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO investment_memories
+                        (id, embedding, summary, metadata, ticker, source_priority, is_cited)
+                    VALUES (%s, %s::vector, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        memory_id,
+                        _vec_literal(insight.embedding),
+                        insight.summary,
+                        Jsonb(insight.metadata),
+                        insight.ticker.upper(),
+                        insight.source_priority,
+                        insight.is_cited,
+                    ),
+                )
+
+    try:
+        await run_db_operation(insert, operation_name="store insight")
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        await append_db_outbox_entry(
+            operation="insert",
+            table="investment_memories",
+            ticker=insight.ticker,
+            payload={"records": [payload]},
+            error=str(e),
+        )
+        logger.warning(
+            "[VectorMemory] Queued insight %s for %s in local DB outbox after transient failure: %s",
+            memory_id[:8],
+            insight.ticker,
+            e,
+        )
+        return memory_id
 
     logger.debug(f"[VectorMemory] Stored insight {memory_id[:8]}… for {insight.ticker}")
     return memory_id
@@ -103,29 +127,58 @@ async def batch_store_insights(insights: list[InsightRecord]) -> list[str]:
     ids: list[str] = [str(uuid.uuid4()) for _ in insights]
     placeholders: list[str] = []
     params: list[Any] = []
-    pool = await get_pool()
 
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            for insight, memory_id in zip(insights, ids):
-                placeholders.append(
-                    "(%s, %s::vector, %s, %s, %s, %s, %s)"
-                )
-                params.extend([
-                    memory_id,
-                    _vec_literal(insight.embedding),
-                    insight.summary,
-                    Jsonb(insight.metadata),
-                    insight.ticker.upper(),
-                    insight.source_priority,
-                    insight.is_cited,
-                ])
-            query = f"""
-                INSERT INTO investment_memories
-                    (id, embedding, summary, metadata, ticker, source_priority, is_cited)
-                VALUES {', '.join(placeholders)}
-            """
-            await cur.execute(query, params)
+    for insight, memory_id in zip(insights, ids):
+        placeholders.append(
+            "(%s, %s::vector, %s, %s, %s, %s, %s)"
+        )
+        params.extend([
+            memory_id,
+            _vec_literal(insight.embedding),
+            insight.summary,
+            Jsonb(insight.metadata),
+            insight.ticker.upper(),
+            insight.source_priority,
+            insight.is_cited,
+        ])
+
+    payload = {
+        "records": [
+            _insight_outbox_record(insight, memory_id)
+            for insight, memory_id in zip(insights, ids)
+        ]
+    }
+
+    async def insert_batch() -> None:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                query = f"""
+                    INSERT INTO investment_memories
+                        (id, embedding, summary, metadata, ticker, source_priority, is_cited)
+                    VALUES {', '.join(placeholders)}
+                    ON CONFLICT (id) DO NOTHING
+                """
+                await cur.execute(query, params)
+
+    try:
+        await run_db_operation(insert_batch, operation_name="batch store insights")
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        await append_db_outbox_entry(
+            operation="insert",
+            table="investment_memories",
+            ticker=insights[0].ticker,
+            payload=payload,
+            error=str(e),
+        )
+        logger.warning(
+            "[VectorMemory] Queued %d insight inserts in local DB outbox after transient failure: %s",
+            len(ids),
+            e,
+        )
+        return ids
 
     logger.info(f"[VectorMemory] Batch-stored {len(ids)} insights")
     return ids
@@ -608,23 +661,43 @@ async def update_validity_status(memory_ids: list[str], status: str) -> int:
     if not memory_ids:
         return 0
 
-    pool = await get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE investment_memories
-                SET metadata = jsonb_set(
-                    COALESCE(metadata, '{}'::jsonb),
-                    '{validity_status}',
-                    %s::jsonb
-                ),
-                    updated_at = NOW()
-                WHERE id = ANY(%s::uuid[])
-                """,
-                (f'"{status}"', memory_ids),
-            )
-            updated = cur.rowcount
+    async def update() -> int:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE investment_memories
+                    SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{validity_status}',
+                        %s::jsonb
+                    ),
+                        updated_at = NOW()
+                    WHERE id = ANY(%s::uuid[])
+                    """,
+                    (f'"{status}"', memory_ids),
+                )
+                return cur.rowcount
+
+    try:
+        updated = await run_db_operation(update, operation_name="update memory validity status")
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        await append_db_outbox_entry(
+            operation="update_validity_status",
+            table="investment_memories",
+            ticker="",
+            payload={"memory_ids": memory_ids, "status": status},
+            error=str(e),
+        )
+        logger.warning(
+            "[VectorMemory] Queued validity_status update for %d memories after transient failure: %s",
+            len(memory_ids),
+            e,
+        )
+        return 0
     try:
         for memory_id in memory_ids:
             await update_pillar_lifecycle(memory_id=memory_id, status=status)
@@ -727,20 +800,39 @@ async def mark_memories_cited(memory_ids: list[str]) -> int:
     if not memory_ids:
         return 0
 
-    pool = await get_pool()
+    async def update() -> int:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                # Use ANY with array parameter for batch update
+                await cur.execute(
+                    """
+                    UPDATE investment_memories
+                    SET is_cited = true, updated_at = NOW()
+                    WHERE id = ANY(%s::uuid[])
+                    """,
+                    (memory_ids,),
+                )
+                return cur.rowcount
 
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # Use ANY with array parameter for batch update
-            await cur.execute(
-                """
-                UPDATE investment_memories
-                SET is_cited = true, updated_at = NOW()
-                WHERE id = ANY(%s::uuid[])
-                """,
-                (memory_ids,),
-            )
-            updated = cur.rowcount
+    try:
+        updated = await run_db_operation(update, operation_name="mark memories cited")
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        await append_db_outbox_entry(
+            operation="mark_cited",
+            table="investment_memories",
+            ticker="",
+            payload={"memory_ids": memory_ids},
+            error=str(e),
+        )
+        logger.warning(
+            "[VectorMemory] Queued cited update for %d memories after transient failure: %s",
+            len(memory_ids),
+            e,
+        )
+        return 0
 
     for memory_id in memory_ids:
         await update_pillar_lifecycle(memory_id=memory_id, status="supported")
@@ -1111,7 +1203,21 @@ async def upsert_investment_pillar(
     merged_into_pillar_id: str = "",
 ) -> int:
     """Upsert the queryable identity/lifecycle row for a thesis pillar."""
-    try:
+    payload = {
+        "ticker": ticker.upper(),
+        "pillar_id": pillar_id,
+        "pillar_type": pillar_type,
+        "canonical_statement": canonical_statement,
+        "statement_hash": statement_hash,
+        "status": status,
+        "version": version,
+        "current_memory_id": current_memory_id,
+        "detail_path": detail_path,
+        "detail_citation": detail_citation,
+        "merged_into_pillar_id": merged_into_pillar_id,
+    }
+
+    async def upsert() -> int:
         pool = await get_pool()
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -1154,7 +1260,24 @@ async def upsert_investment_pillar(
                     ),
                 )
                 return cur.rowcount
+
+    try:
+        return await run_db_operation(upsert, operation_name="upsert investment pillar")
     except Exception as e:
+        if is_transient_db_error(e):
+            await append_db_outbox_entry(
+                operation="upsert",
+                table="investment_pillars",
+                ticker=ticker,
+                payload=payload,
+                error=str(e),
+            )
+            logger.warning(
+                "[VectorMemory] Queued investment_pillars upsert for %s after transient failure: %s",
+                pillar_id,
+                e,
+            )
+            return 0
         logger.warning("[VectorMemory] investment_pillars upsert skipped for %s: %s", pillar_id, e)
         return 0
 
@@ -1169,42 +1292,64 @@ async def update_pillar_lifecycle(
     """Update identity table lifecycle from a pillar ID or current memory ID."""
     if not pillar_id and not memory_id:
         return 0
+    payload = {
+        "pillar_id": pillar_id,
+        "memory_id": memory_id,
+        "status": status,
+        "merged_into_pillar_id": merged_into_pillar_id,
+    }
     try:
-        pool = await get_pool()
-        clauses: list[str] = []
-        where_params: list[Any] = []
-        if pillar_id:
-            clauses.append("pillar_id = %s")
-            where_params.append(pillar_id)
-        if memory_id:
-            clauses.append("current_memory_id = %s::uuid")
-            where_params.append(memory_id)
+        async def update() -> int:
+            pool = await get_pool()
+            clauses: list[str] = []
+            where_params: list[Any] = []
+            if pillar_id:
+                clauses.append("pillar_id = %s")
+                where_params.append(pillar_id)
+            if memory_id:
+                clauses.append("current_memory_id = %s::uuid")
+                where_params.append(memory_id)
 
-        where = " OR ".join(clauses)
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    f"""
-                    UPDATE investment_pillars
-                    SET status = %s,
-                        merged_into_pillar_id = COALESCE(NULLIF(%s, ''), merged_into_pillar_id),
-                        updated_at = NOW(),
-                        last_seen_at = CASE
-                            WHEN %s = ANY(%s::text[]) THEN NOW()
-                            ELSE last_seen_at
-                        END
-                    WHERE {where}
-                    """,
-                    (
-                        status,
-                        merged_into_pillar_id,
-                        status,
-                        list(ACTIVE_PILLAR_STATUSES),
-                        *where_params,
-                    ),
-                )
-                return cur.rowcount
+            where = " OR ".join(clauses)
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE investment_pillars
+                        SET status = %s,
+                            merged_into_pillar_id = COALESCE(NULLIF(%s, ''), merged_into_pillar_id),
+                            updated_at = NOW(),
+                            last_seen_at = CASE
+                                WHEN %s = ANY(%s::text[]) THEN NOW()
+                                ELSE last_seen_at
+                            END
+                        WHERE {where}
+                        """,
+                        (
+                            status,
+                            merged_into_pillar_id,
+                            status,
+                            list(ACTIVE_PILLAR_STATUSES),
+                            *where_params,
+                        ),
+                    )
+                    return cur.rowcount
+
+        return await run_db_operation(update, operation_name="update pillar lifecycle")
     except Exception as e:
+        if is_transient_db_error(e):
+            await append_db_outbox_entry(
+                operation="update_lifecycle",
+                table="investment_pillars",
+                ticker="",
+                payload=payload,
+                error=str(e),
+            )
+            logger.warning(
+                "[VectorMemory] Queued investment_pillars lifecycle update after transient failure: %s",
+                e,
+            )
+            return 0
         logger.debug("[VectorMemory] investment_pillars lifecycle update skipped: %s", e)
         return 0
 
@@ -1240,6 +1385,18 @@ async def find_similar_pillar_memories(
 def _vec_literal(vec: list[float]) -> str:
     """Convert a Python list to a pgvector literal string: '[0.1,0.2,...]'."""
     return "[" + ",".join(str(v) for v in vec) + "]"
+
+
+def _insight_outbox_record(insight: InsightRecord, memory_id: str) -> dict[str, Any]:
+    return {
+        "id": memory_id,
+        "ticker": insight.ticker.upper(),
+        "summary": insight.summary,
+        "embedding": insight.embedding,
+        "metadata": insight.metadata,
+        "source_priority": insight.source_priority,
+        "is_cited": insight.is_cited,
+    }
 
 
 def _row_to_memory(row: dict) -> MemoryRecord:
@@ -1651,27 +1808,46 @@ async def mark_pillar_transition(
     Returns:
         Number of rows updated (0 or 1).
     """
-    pool = await get_pool()
-
-    updates = {"validity_status": new_status}
+    updates: dict[str, str | int] = {"validity_status": new_status}
     if superseded_by:
         updates["superseded_by"] = superseded_by
     if version is not None:
         updates["version"] = version
 
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE investment_memories
-                SET metadata = metadata || %s::jsonb,
-                    updated_at = NOW(),
-                    is_cited = false
-                WHERE id = %s::uuid
-                """,
-                (Jsonb(updates), memory_id),
-            )
-            updated = cur.rowcount
+    async def update() -> int:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE investment_memories
+                    SET metadata = metadata || %s::jsonb,
+                        updated_at = NOW(),
+                        is_cited = false
+                    WHERE id = %s::uuid
+                    """,
+                    (Jsonb(updates), memory_id),
+                )
+                return cur.rowcount
+
+    try:
+        updated = await run_db_operation(update, operation_name="mark pillar transition")
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        await append_db_outbox_entry(
+            operation="mark_pillar_transition",
+            table="investment_memories",
+            ticker="",
+            payload={"memory_id": memory_id, "updates": updates},
+            error=str(e),
+        )
+        logger.warning(
+            "[VectorMemory] Queued pillar transition for memory %s after transient failure: %s",
+            memory_id,
+            e,
+        )
+        return 0
     await update_pillar_lifecycle(memory_id=memory_id, status=new_status)
     return updated
 

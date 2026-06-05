@@ -1,4 +1,5 @@
 """Tests for ticker validation — schema-level and application boundary."""
+# pyright: reportArgumentType=false, reportCallIssue=false
 
 import pytest
 

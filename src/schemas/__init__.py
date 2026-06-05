@@ -25,11 +25,17 @@ from schemas.rag import (
     InsightRecord as InsightRecord,
     MemoryRecord as MemoryRecord,
     ResearchTopic as ResearchTopic,
+    SourceInventoryRecord as SourceInventoryRecord,
+    ResearchTask as ResearchTask,
+    ResearchFinding as ResearchFinding,
+    ResearchFindingBundle as ResearchFindingBundle,
     ThesisPillar as ThesisPillar,
     PillarOutcome as PillarOutcome,
     PillarType,
     PillarStatus,
     PillarOutcomeStatus,
+    ResearchTaskKind,
+    ResearchTaskStatus,
 )
 from schemas.maintenance import (
     DuplicateGroup as DuplicateGroup,

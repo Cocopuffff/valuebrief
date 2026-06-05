@@ -1,4 +1,6 @@
+# pyright: reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false
 import asyncio
+import pathlib
 
 import utils.citations as citations_mod
 from agents import report_generator as report_generator_mod
@@ -76,8 +78,23 @@ def test_report_generator_injects_resolvable_vault_citations(monkeypatch, tmp_pa
     assert "citation_manifest" in command.update
 
 
-def test_report_generator_includes_thesis_pillars_section():
+def test_report_generator_includes_thesis_pillars_section(monkeypatch):
     """When thesis_pillars are present, they appear in the report."""
+    async def fake_persist_research_artifact(**kwargs):
+        from schemas.rag import VaultArtifact
+        return VaultArtifact(
+            ticker=kwargs["ticker"],
+            path="",
+            filename="",
+            source_type=kwargs["source_type"],
+        )
+
+    monkeypatch.setattr(
+        report_generator_mod,
+        "persist_research_artifact",
+        fake_persist_research_artifact,
+    )
+
     state = {
         "date": "2026-05-02",
         "run_datetime": "",
@@ -122,3 +139,61 @@ def test_report_generator_includes_thesis_pillars_section():
     assert "file.md#^block123" in report
     # Sources section has the website source
     assert "https://example.com/report" in report
+
+
+def test_report_generator_pillar_fixture_does_not_write_real_vault(monkeypatch):
+    before = set(pathlib.Path("data/vault").glob("CRM/*.md"))
+
+    async def fake_persist_research_artifact(**kwargs):
+        from schemas.rag import VaultArtifact
+        return VaultArtifact(
+            ticker=kwargs["ticker"],
+            path="",
+            filename="",
+            source_type=kwargs["source_type"],
+        )
+
+    monkeypatch.setattr(
+        report_generator_mod,
+        "persist_research_artifact",
+        fake_persist_research_artifact,
+    )
+
+    state = {
+        "date": "2026-05-02",
+        "run_datetime": "",
+        "company": "Salesforce.com Inc",
+        "ticker": "CRM",
+        "price_data": None,
+        "bull_thesis": "Bull thesis",
+        "bear_thesis": "Bear thesis",
+        "sources": ["https://example.com/report"],
+        "judge_decision": "Buy on weakness.",
+        "valuation": None,
+        "final_report": "",
+        "citation_manifest": [],
+        "curator_log": "",
+        "active_memory_ids": [],
+        "vault_artifacts": [],
+        "rag_context": "",
+        "retrieved_memory_ids": [],
+        "research_topics": [],
+        "thesis_pillars": [
+            {
+                "pillar_id": "CRM-moat-001",
+                "pillar_type": "moat",
+                "statement": "Salesforce has a wide economic moat.",
+                "rationale": "High switching costs and ecosystem lock-in.",
+                "valuation_impact": "Supports premium valuation multiple.",
+                "source_urls": ["https://example.com/moat"],
+                "evidence_citations": ["file.md#^block123"],
+                "status": "supported",
+            },
+        ],
+        "pillar_outcomes": [],
+    }
+
+    asyncio.run(report_generator_mod.report_generator(state))
+
+    after = set(pathlib.Path("data/vault").glob("CRM/*.md"))
+    assert after == before

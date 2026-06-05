@@ -1,6 +1,9 @@
+import asyncio
 import os
+import re
+import threading
 import yfinance as yf
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Coroutine
 from datetime import date, datetime
 from schemas import Asset, FinancialMetrics, SearchResult, NewsResult
 from langchain.tools import tool
@@ -9,10 +12,15 @@ import httpx
 from markdownify import markdownify
 from utils.logger import get_logger
 from utils.config import exchange_mappings
+from utils.db import get_pool
 
 logger = get_logger(__name__)
 
 class FinancialDataProvider:
+    _sec_ticker_cache: dict[str, str] | None = None
+    _sec_ticker_cache_sec_refresh_attempted = False
+    _SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+
     @staticmethod
     def translate_ticker_for_av(ticker: str) -> str:
         """Translate a Yahoo Finance ticker to AlphaVantage format using exchange mappings."""
@@ -180,13 +188,315 @@ class FinancialDataProvider:
                 assets.append(asset)
         return assets
     
+    @staticmethod
+    def _sec_headers() -> dict[str, str]:
+        user_agent = os.getenv(
+            "SEC_USER_AGENT",
+            "ValueBrief research bot contact@example.com",
+        )
+        return {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
+
+    @staticmethod
+    def _run_async_blocking(coro: Coroutine[Any, Any, Any]) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        result: dict[str, Any] = {}
+
+        def runner() -> None:
+            try:
+                result["value"] = asyncio.run(coro)
+            except BaseException as e:
+                result["exception"] = e
+
+        thread = threading.Thread(target=runner)
+        thread.start()
+        thread.join()
+
+        if "exception" in result:
+            raise result["exception"]
+        return result.get("value")
+
+    @staticmethod
+    def _parse_sec_company_tickers(raw: Any) -> list[tuple[str, str, str]]:
+        records: list[tuple[str, str, str]] = []
+        for item in raw.values():
+            ticker = str(item.get("ticker", "")).strip().upper()
+            cik_raw = item.get("cik_str")
+            if not ticker or cik_raw in (None, ""):
+                continue
+
+            cik = str(cik_raw).strip()
+            if not cik.isdigit():
+                continue
+
+            company_name = str(item.get("title") or "").strip()
+            records.append((ticker, cik.zfill(10), company_name))
+        return records
+
+    @staticmethod
+    def _records_to_sec_ticker_map(records: list[tuple[str, str, str]]) -> dict[str, str]:
+        return {ticker: cik for ticker, cik, _ in records if ticker and cik}
+
+    @staticmethod
+    async def _load_sec_ticker_cache_from_supabase_async() -> dict[str, str]:
+        try:
+            pool = await get_pool()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT ticker, cik FROM sec_company_tickers")
+                    rows = await cur.fetchall()
+        except Exception as e:
+            logger.warning("[Provider] Failed to load SEC ticker map from Supabase: %s", e)
+            return {}
+
+        mapping = {str(ticker).upper(): str(cik).zfill(10) for ticker, cik in rows}
+        if mapping:
+            logger.info("[Provider] Loaded %d SEC ticker mappings from Supabase", len(mapping))
+        return mapping
+
+    @staticmethod
+    async def _save_sec_company_tickers_to_supabase_async(
+        records: list[tuple[str, str, str]],
+    ) -> None:
+        if not records:
+            return
+
+        try:
+            pool = await get_pool()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.executemany(
+                        """
+                        INSERT INTO sec_company_tickers (ticker, cik, company_name, updated_at)
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (ticker) DO UPDATE SET
+                            cik = EXCLUDED.cik,
+                            company_name = EXCLUDED.company_name,
+                            updated_at = NOW()
+                        """,
+                        records,
+                    )
+            logger.info("[Provider] Persisted %d SEC ticker mappings to Supabase", len(records))
+        except Exception as e:
+            logger.warning("[Provider] Failed to persist SEC ticker map to Supabase: %s", e)
+
+    @staticmethod
+    async def _download_sec_ticker_map_async() -> dict[str, str]:
+        try:
+            async with httpx.AsyncClient(
+                headers=FinancialDataProvider._sec_headers(),
+                timeout=10,
+            ) as client:
+                response = await client.get(FinancialDataProvider._SEC_COMPANY_TICKERS_URL)
+            response.raise_for_status()
+            records = FinancialDataProvider._parse_sec_company_tickers(response.json())
+            mapping = FinancialDataProvider._records_to_sec_ticker_map(records)
+            if mapping:
+                await FinancialDataProvider._save_sec_company_tickers_to_supabase_async(records)
+            return mapping
+        except Exception as e:
+            logger.warning("[Provider] Failed to load SEC ticker map: %s", e)
+            return {}
+
+    @staticmethod
+    async def load_sec_ticker_cache_async() -> dict[str, str]:
+        """Load SEC ticker-to-CIK mapping from Supabase, falling back to SEC."""
+        if FinancialDataProvider._sec_ticker_cache is not None:
+            return FinancialDataProvider._sec_ticker_cache
+
+        mapping = await FinancialDataProvider._load_sec_ticker_cache_from_supabase_async()
+        if not mapping:
+            logger.info("[Provider] SEC ticker map not found in Supabase; downloading from SEC")
+            FinancialDataProvider._sec_ticker_cache_sec_refresh_attempted = True
+            mapping = await FinancialDataProvider._download_sec_ticker_map_async()
+
+        FinancialDataProvider._sec_ticker_cache = mapping
+        return mapping
+
+    @staticmethod
+    def _load_sec_ticker_cache() -> dict[str, str]:
+        """Synchronous compatibility wrapper for LangChain tool callers."""
+        return FinancialDataProvider._run_async_blocking(
+            FinancialDataProvider.load_sec_ticker_cache_async()
+        )
+
+    @staticmethod
+    async def _sec_cik_for_ticker_async(ticker: str) -> str:
+        base_ticker = ticker.split(".", 1)[0].upper()
+        mapping = await FinancialDataProvider.load_sec_ticker_cache_async()
+        cik = mapping.get(base_ticker, "")
+        if cik or FinancialDataProvider._sec_ticker_cache_sec_refresh_attempted:
+            return cik
+
+        logger.info(
+            "[Provider] %s missing from persisted SEC ticker map; refreshing from SEC",
+            base_ticker,
+        )
+        FinancialDataProvider._sec_ticker_cache_sec_refresh_attempted = True
+        refreshed = await FinancialDataProvider._download_sec_ticker_map_async()
+        if refreshed:
+            FinancialDataProvider._sec_ticker_cache = refreshed
+            return refreshed.get(base_ticker, "")
+        return ""
+
+    @staticmethod
+    def _sec_cik_for_ticker(ticker: str) -> str:
+        """Synchronous compatibility wrapper for LangChain tool callers."""
+        return FinancialDataProvider._run_async_blocking(
+            FinancialDataProvider._sec_cik_for_ticker_async(ticker)
+        )
+
+    @staticmethod
+    async def _get_sec_filing_records_async(
+        ticker: str,
+        forms: Optional[list[str]] = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        cik = await FinancialDataProvider._sec_cik_for_ticker_async(ticker)
+        if not cik:
+            logger.info("[Provider] No SEC CIK found for %s", ticker)
+            return []
+
+        form_filter = {f.upper() for f in (forms or ["10-K", "10-Q", "8-K"])}
+        try:
+            async with httpx.AsyncClient(
+                headers=FinancialDataProvider._sec_headers(),
+                timeout=10,
+            ) as client:
+                response = await client.get(f"https://data.sec.gov/submissions/CIK{cik}.json")
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.warning("[Provider] SEC submissions lookup failed for %s: %s", ticker, e)
+            return []
+
+        recent = data.get("filings", {}).get("recent", {})
+        forms_raw = recent.get("form", [])
+        filing_dates = recent.get("filingDate", [])
+        report_dates = recent.get("reportDate", [])
+        accession_numbers = recent.get("accessionNumber", [])
+        primary_documents = recent.get("primaryDocument", [])
+
+        results: list[dict[str, Any]] = []
+        entity_name = data.get("name", "")
+        cik_int = str(int(cik))
+        for idx, form in enumerate(forms_raw):
+            form = str(form).upper()
+            if form not in form_filter:
+                continue
+
+            accession = str(accession_numbers[idx]) if idx < len(accession_numbers) else ""
+            primary_doc = str(primary_documents[idx]) if idx < len(primary_documents) else ""
+            accession_path = accession.replace("-", "")
+            if primary_doc:
+                url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_path}/{primary_doc}"
+            else:
+                url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_path}/"
+
+            results.append({
+                "ticker": ticker.upper(),
+                "company": entity_name,
+                "source_type": "sec_filing",
+                "form_type": form,
+                "filing_date": filing_dates[idx] if idx < len(filing_dates) else "",
+                "report_date": report_dates[idx] if idx < len(report_dates) else "",
+                "accession_number": accession,
+                "primary_document": primary_doc,
+                "url": url,
+            })
+            if len(results) >= limit:
+                break
+        return results
+
+    @staticmethod
+    def _get_sec_filing_records(
+        ticker: str,
+        forms: Optional[list[str]] = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Synchronous compatibility wrapper for LangChain tool callers."""
+        return FinancialDataProvider._run_async_blocking(
+            FinancialDataProvider._get_sec_filing_records_async(
+                ticker=ticker,
+                forms=forms,
+                limit=limit,
+            )
+        )
+
     @tool
     @staticmethod
-    def get_sec_filings(ticker: str) -> str:
+    def get_sec_filings(
+        ticker: str,
+        forms: Optional[list[str]] = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Fetch recent official SEC filings for a US-listed ticker.
+
+        Args:
+            ticker: Stock ticker, e.g. AAPL.
+            forms: SEC form types to include, e.g. ["10-K", "10-Q", "8-K"].
+            limit: Maximum number of filings to return.
         """
-        Returns SEC filings for ticker
+        if isinstance(forms, str):
+            forms = [forms]
+        return FinancialDataProvider._get_sec_filing_records(
+            ticker=ticker,
+            forms=forms,
+            limit=limit,
+        )
+
+    @tool
+    @staticmethod
+    def discover_earnings_call_transcripts(
+        ticker: str,
+        company: str = "",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Discover earnings-call transcript sources using web search.
+
+        Prefer company investor-relations pages when they appear in results.
+        Returns titles, URLs, snippets, and source metadata; use scrape_website
+        on promising URLs to read the transcript content.
         """
-        return "filing"
+        company_part = f'"{company}" ' if company else ""
+        query = (
+            f'{company_part}{ticker.upper()} earnings call transcript '
+            "investor relations 10-Q 10-K latest"
+        )
+        logger.info('[Provider] Discovering earnings transcripts with "%s"', query)
+        try:
+            raw_results = list(DDGS().text(query, region="us-en", max_results=max(10, limit)))
+        except Exception as e:
+            logger.error("[Provider] Error discovering transcripts for %s: %s", ticker, e)
+            return []
+
+        records: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        ir_pattern = re.compile(r"(investor|ir\.|investors|quarterly-results|events)", re.I)
+        for item in raw_results:
+            normalized = dict(item)
+            url = str(normalized.get("href") or normalized.get("url") or "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            title = str(normalized.get("title", ""))
+            snippet = str(normalized.get("body") or normalized.get("snippet") or "")
+            records.append({
+                "ticker": ticker.upper(),
+                "company": company,
+                "source_type": "earnings_transcript",
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "source": str(normalized.get("source", "")),
+                "is_company_ir": bool(ir_pattern.search(url) or ir_pattern.search(title)),
+            })
+            if len(records) >= limit:
+                break
+        return records
     
     @tool
     @staticmethod

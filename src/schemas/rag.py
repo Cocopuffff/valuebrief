@@ -40,6 +40,23 @@ PillarOutcomeStatus = Literal[
     "stale",
 ]
 
+ResearchTaskKind = Literal[
+    "source_discovery",
+    "business_model",
+    "financial_history",
+    "risk_assessment",
+    "pillar_validation",
+    "research_synthesis",
+]
+
+ResearchTaskStatus = Literal[
+    "pending",
+    "in_progress",
+    "completed",
+    "blocked",
+    "skipped",
+]
+
 
 class VaultFrontmatter(StrictBaseModel):
     """YAML frontmatter fields for a vault Markdown file."""
@@ -115,6 +132,56 @@ class ResearchTopic(StrictBaseModel):
     question: str
     rationale: str
     evidence_memory_ids: list[str] = Field(default_factory=list)
+
+
+class SourceInventoryRecord(StrictBaseModel):
+    """A known source artifact available for a ticker before fresh research starts."""
+    ticker: Ticker
+    source_type: str
+    title: str = ""
+    form_type: str = ""
+    period: str = ""
+    filed_at: str = ""
+    url: str = ""
+    accession_number: str = ""
+    local_path: str = ""
+    freshness: str = "unknown"
+
+
+class ResearchTask(StrictBaseModel):
+    """A supervisor-assigned research task for the neutral research analyst."""
+    task_id: str
+    kind: ResearchTaskKind
+    title: str
+    objective: str
+    status: ResearchTaskStatus = "pending"
+    depends_on: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    source_requirements: list[str] = Field(default_factory=list)
+    evidence_memory_ids: list[str] = Field(default_factory=list)
+    mandatory: bool = True
+
+
+class ResearchFinding(StrictBaseModel):
+    """Structured output from one completed research task."""
+    task_id: str
+    title: str = ""
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
+    citations: list[str] = Field(default_factory=list)
+    source_inventory: list[SourceInventoryRecord] = Field(default_factory=list)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    artifact_path: str = ""
+    memory_ids: list[str] = Field(default_factory=list)
+    needs_follow_up: bool = False
+    follow_up_reason: str = ""
+
+
+class ResearchFindingBundle(StrictBaseModel):
+    """Deep Agent structured response containing one or more task findings."""
+    findings: list[ResearchFinding] = Field(default_factory=list)
+    synthesis: str = ""
 
 
 class ThesisPillar(StrictBaseModel):

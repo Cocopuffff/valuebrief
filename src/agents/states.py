@@ -23,6 +23,12 @@ class WorkflowState(TypedDict):
     rag_context: str                   # Formatted prior memories prose for analysts
     retrieved_memory_ids: list[str]    # UUIDs retrieved this run from vector store
     research_topics: list[dict]        # Serialized ResearchTopic list for routing
+    research_goal: str                 # User-facing objective used to generate research tasks
+    source_inventory: list[dict]       # Serialized SourceInventoryRecord entries
+    research_tasks: list[dict]         # Serialized ResearchTask queue
+    current_task_id: str               # Task currently assigned to the research analyst
+    research_findings: Annotated[list[dict], operator.add]  # Serialized ResearchFinding output
+    research_synthesis: str            # Neutral synthesis across completed findings
     retrieved_memory_outcomes: dict[str, str]  # memory_id -> supported|weakened|revised|contradicted|stale
     thesis_pillars: list[dict]         # Serialized ThesisPillar list from Judge
     pillar_outcomes: list[dict]        # Serialized PillarOutcome list from Judge
@@ -41,6 +47,25 @@ class ResearchState(TypedDict):
     sources: Annotated[list[str], operator.add]
     messages: Annotated[list[str], operator.add]
     rag_context: str
+
+class ResearchTaskState(TypedDict):
+    date: str
+    run_datetime: str
+    company: str
+    ticker: str
+    price_data: Optional[Asset]
+    existing_valuation: Optional[ValuationModel]
+    research_goal: str
+    task: dict
+    research_tasks: list[dict]
+    source_inventory: list[dict]
+    rag_context: str
+    prior_findings: list[dict]
+    sources: Annotated[list[str], operator.add]
+    finding: dict
+    synthesis: str
+    vault_artifacts: Annotated[list[dict], operator.add]
+    active_memory_ids: Annotated[list[str], operator.add]
 
 class Context:
     user_id: str

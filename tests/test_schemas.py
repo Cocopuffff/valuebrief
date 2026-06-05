@@ -3,6 +3,7 @@ test_schemas.py
 ~~~~~~~~~~~~~~~
 Pydantic schema validation tests for the schemas package.
 """
+# pyright: reportArgumentType=false, reportCallIssue=false, reportInvalidTypeForm=false
 
 import pytest
 from datetime import datetime
@@ -208,6 +209,42 @@ class TestMemoryRecord:
             updated_at=now,
         )
         assert mr.similarity is None
+
+
+# ── Research Tasks ────────────────────────────────────────────────────
+class TestResearchTaskModels:
+    def test_research_task_defaults(self):
+        task = ResearchTask(
+            task_id="T1",
+            kind="source_discovery",
+            title="Find sources",
+            objective="Find recent filings.",
+        )
+        assert task.status == "pending"
+        assert task.mandatory is True
+        assert task.depends_on == []
+
+    def test_source_inventory_record(self):
+        record = SourceInventoryRecord(
+            ticker="aapl",
+            source_type="sec_filing",
+            form_type="10-K",
+            filed_at="2026-01-31",
+            url="https://www.sec.gov/example",
+        )
+        assert record.ticker == "AAPL"
+        assert record.freshness == "unknown"
+
+    def test_research_finding_bundle(self):
+        finding = ResearchFinding(
+            task_id="T2",
+            title="Business model",
+            summary="The company sells subscriptions.",
+            confidence=0.8,
+        )
+        bundle = ResearchFindingBundle(findings=[finding], synthesis="Neutral synthesis")
+        assert bundle.findings[0].task_id == "T2"
+        assert bundle.synthesis == "Neutral synthesis"
 
 
 # ── Maintenance ──────────────────────────────────────────────────────────

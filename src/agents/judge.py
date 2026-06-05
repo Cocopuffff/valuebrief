@@ -4,7 +4,8 @@ from langchain.messages import SystemMessage, HumanMessage
 from langgraph.types import Command
 from typing import Literal
 from agents.states import WorkflowState
-from schemas import ValuationModel, AgentNode
+from schemas import ValuationModel, AgentNode, VaultArtifact
+from schemas.rag import PillarOutcomeStatus
 from utils.logger import get_logger, log_node_execution
 from utils.report_writer import RunReportWriter
 from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
@@ -12,18 +13,26 @@ from utils.config import judge_model, valuation_model
 
 logger = get_logger(__name__)
 
+PILLAR_OUTCOME_STATUSES: set[PillarOutcomeStatus] = {
+    "supported",
+    "weakened",
+    "revised",
+    "contradicted",
+    "stale",
+}
+
 
 # ── Prompts ──────────────────────────────────────────────────────────────
 
 SYNTHESIS_SYSTEM = """\
 Act as an expert stock research analyst grounded in value investing principles. \
-You are presented with bull and bear theses for {company} ({ticker}) \
-and you are tasked with synthesizing both sides' research to create an investment thesis \
-for {company}. This research should take an opinionated view based on the \
-evidence presented by the bull and bear analysts and should include the hallmarks of \
-value investing like discounted cash flow based on probability of outcomes and \
-investability based on margin of safety. Present this information as your own analysis \
-without naming bull or bear parties. Do NOT call any tools. Respond with plain text only.\
+You are presented with cited research findings for {company} ({ticker}) \
+and you are tasked with synthesizing the evidence into an objective investment thesis \
+for {company}. This research should include the hallmarks of value investing, \
+including normalized free cash flow, intrinsic value drivers, downside risk, \
+discounted cash flow assumptions, and investability based on margin of safety. \
+Present this information as your own analysis. Do NOT call any tools. \
+Respond with plain text only.\
 """
 
 VALUATION_SYSTEM = """\
@@ -167,6 +176,39 @@ def _build_fundamentals_summary(state: WorkflowState) -> str:
         f"Industry: {asset.industry}" if asset.industry else None,
     ]
     return "\n".join(line for line in lines if line)
+
+
+def _build_research_findings_context(state: WorkflowState) -> str:
+    findings = state.get("research_findings", [])
+    if not findings:
+        return (
+            f"BULL THESIS:\n{state.get('bull_thesis', 'N/A')}\n\n"
+            f"BEAR THESIS:\n{state.get('bear_thesis', 'N/A')}"
+        )
+
+    sections: list[str] = []
+    for i, finding in enumerate(findings, 1):
+        key_points = "\n".join(
+            f"- {point}" for point in finding.get("key_points", [])
+        ) or "- None recorded."
+        sources = "\n".join(
+            f"- {url}" for url in finding.get("source_urls", [])
+        ) or "- None recorded."
+        citations = "\n".join(
+            f"- {citation}" for citation in finding.get("citations", [])
+        ) or "- None recorded."
+        sections.append(
+            f"## Research Finding {i}: {finding.get('title') or finding.get('task_id')}\n\n"
+            f"Task ID: {finding.get('task_id', '')}\n"
+            f"Confidence: {finding.get('confidence', '')}\n\n"
+            f"Summary:\n{finding.get('summary', '')}\n\n"
+            f"Key Points:\n{key_points}\n\n"
+            f"Sources:\n{sources}\n\n"
+            f"Vault Citations:\n{citations}"
+        )
+    if state.get("research_synthesis"):
+        sections.append(f"## Analyst Synthesis\n\n{state['research_synthesis']}")
+    return "\n\n".join(sections)
 
 
 def _parse_valuation_response(raw: str, state: WorkflowState) -> ValuationModel:
@@ -355,10 +397,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
     synthesis_messages = [
         SystemMessage(content=synthesis_prompt),
         HumanMessage(
-            content=(
-                f"BULL THESIS:\n{state.get('bull_thesis', 'N/A')}\n\n"
-                f"BEAR THESIS:\n{state.get('bear_thesis', 'N/A')}"
-            )
+            content=_build_research_findings_context(state)
         ),
     ]
     synthesis_response = await judge_model.ainvoke(synthesis_messages)
@@ -505,6 +544,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
             "synthesis": initial_synthesis,
             "bull": state.get("bull_thesis") or "",
             "bear": state.get("bear_thesis") or "",
+            "research_findings": state.get("research_findings", []),
             "final_decision": final_decision if isinstance(final_decision, str) else str(final_decision),
         }
         valuation.valuation_data = valuation.model_dump(mode="json")
@@ -520,7 +560,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         f"## Final Decision\n\n"
         f"{final_decision if isinstance(final_decision, str) else str(final_decision)}"
     )
-    artifact: dict = {}
+    artifact: VaultArtifact | None = None
     try:
         artifact = await persist_research_artifact(
             ticker=state["ticker"],
@@ -562,7 +602,7 @@ async def judge_analyst(state: WorkflowState) -> Command[Literal[AgentNode.REPOR
         "thesis_pillars": [p.model_dump(mode="json") for p in thesis_pillars],
         "pillar_outcomes": [o.model_dump(mode="json") for o in pillar_outcomes],
     }
-    if artifact.path:
+    if artifact is not None and artifact.path:
         update["vault_artifacts"] = [artifact.model_dump(mode="json")]
 
     return Command(
@@ -668,9 +708,13 @@ def _parse_reconcile_output(
         try:
             memory_id = str(raw_outcome.get("memory_id", ""))
             pillar_id = str(raw_outcome.get("pillar_id", ""))
-            status = str(raw_outcome.get("status", "supported")).strip().lower()
-            if status == "updated":
-                status = "revised"
+            raw_status = str(raw_outcome.get("status", "supported")).strip().lower()
+            if raw_status == "updated":
+                status: PillarOutcomeStatus = "revised"
+            elif raw_status in PILLAR_OUTCOME_STATUSES:
+                status = raw_status
+            else:
+                status = "supported"
 
             # Validate memory_id is in retrieved_ids (security: don't trust LLM to invent UUIDs)
             if memory_id and retrieved_ids and memory_id not in retrieved_ids:

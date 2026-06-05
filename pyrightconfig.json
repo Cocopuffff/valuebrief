@@ -1,5 +1,11 @@
 {
+  "venvPath": ".",
+  "venv": ".venv",
   "extraPaths": [
-    "/Users/kennethquek/Projects/valuebrief/.venv/lib/python3.14/site-packages"
+    "src"
+  ],
+  "include": [
+    "src",
+    "tests"
   ]
 }

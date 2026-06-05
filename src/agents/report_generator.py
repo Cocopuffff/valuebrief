@@ -2,7 +2,7 @@ from typing import Literal
 from langgraph.types import Command
 from agents.states import WorkflowState
 from agents.judge import _build_dcf_summary
-from schemas import AgentNode
+from schemas import AgentNode, VaultArtifact
 
 from utils.logger import log_node_execution, logging
 from utils.db import upsert_valuation
@@ -82,9 +82,8 @@ INVESTMENT THESIS:
 {valuation_section}
 SOURCES:
 {sources_formatted}
-"""
-    report_artifact: dict = {}
-    report_artifacts = list(state.get("vault_artifacts", []))
+    """
+    report_artifact: VaultArtifact | None = None
     try:
         report_artifact = await persist_research_artifact(
             ticker=state["ticker"],
@@ -99,19 +98,27 @@ SOURCES:
                 "source_urls": unique_sources,
             },
         )
-        if report_artifact.path:
-            report_artifacts.append(report_artifact)
     except Exception as e:
         logger.warning(f"[Report Generator] ⚠️ Failed to persist final report: {e}")
+
+    research_debug = ""
+    if state.get("research_findings"):
+        research_debug = (
+            "RESEARCH TASKS:\n"
+            f"{json.dumps(state.get('research_tasks', []), indent=2, default=str)}\n\n"
+            "RESEARCH FINDINGS:\n"
+            f"{json.dumps(state.get('research_findings', []), indent=2, default=str)}\n\n"
+        )
+    else:
+        research_debug = (
+            f"BULL THESIS:\n{state.get('bull_thesis', 'N/A')}\n\n"
+            f"BEAR THESIS:\n{state.get('bear_thesis', 'N/A')}\n\n"
+        )
 
     debug_report = f"""
 DEBUG REPORT: {state['company']} ({state['ticker']})
 
-BULL THESIS:
-{state.get('bull_thesis', 'N/A')}
-
-BEAR THESIS:
-{state.get('bear_thesis', 'N/A')}
+{research_debug}
 
 JUDGE DECISION:
 {state.get('judge_decision', 'N/A')}
@@ -151,7 +158,7 @@ WORKFLOW_STATE:
     ]
 
     update = {"final_report": report, "citation_manifest": manifest}
-    if getattr(report_artifact, "path", False):
+    if report_artifact is not None and report_artifact.path:
         update["vault_artifacts"] = [report_artifact.model_dump(mode="json")]
 
     return Command(update=update, goto=AgentNode.CURATOR)

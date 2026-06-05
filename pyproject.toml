@@ -13,6 +13,7 @@ dependencies = [
     "curl-cffi>=0.14.0",
     "datetime>=6.0",
     "ddgs>=9.12.0",
+    "deepagents>=0.5.3,<0.6",
     "distro>=1.9.0",
     "dotenv>=0.9.9",
     "frozendict>=2.4.7",
@@ -77,3 +78,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+filterwarnings = [
+    "ignore:The default value of `allowed_objects` will change in a future version:langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+]

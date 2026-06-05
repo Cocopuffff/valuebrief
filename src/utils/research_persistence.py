@@ -237,12 +237,12 @@ async def persist_research_artifact(
 
 def _is_model(obj: _ArtifactLike) -> bool:
     """Return True if obj is a VaultArtifact Pydantic model instance."""
-    return hasattr(obj, "memory_ids") and not isinstance(obj, dict)
+    return isinstance(obj, VaultArtifact)
 
 
 def memory_ids_from_artifact(artifact: _ArtifactLike) -> list[str]:
     """Return vector memory IDs from a VaultArtifact or serialised artifact dict."""
-    if _is_model(artifact):
+    if isinstance(artifact, VaultArtifact):
         return [str(mid) for mid in artifact.memory_ids if mid]
     return [str(mid) for mid in artifact.get("memory_ids", []) if mid]
 
@@ -258,7 +258,7 @@ def format_artifact_citations(
     """
     lines: list[str] = []
     for artifact in artifacts:
-        if _is_model(artifact):
+        if isinstance(artifact, VaultArtifact):
             filename = artifact.filename
             block_ids = list(artifact.block_ids or [])
             if not block_ids:

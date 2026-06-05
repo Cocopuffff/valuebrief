@@ -25,9 +25,13 @@ Fix:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from langchain_core.language_models import LanguageModelInput
+from langchain_core.runnables import Runnable
+from langchain_core.messages import AIMessage
+from langchain_core.tools import BaseTool
 from langchain_deepseek import ChatDeepSeek
 
 
@@ -42,6 +46,29 @@ class ChatDeepSeekThinking(ChatDeepSeek):
             extra_body={"thinking": {"type": "enabled"}},
         )
     """
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable | BaseTool],
+        *,
+        tool_choice: dict | str | bool | None = None,
+        strict: bool | None = None,
+        parallel_tool_calls: bool | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        """Bind tools without forcing DeepSeek thinking mode via `tool_choice`.
+
+        DeepSeek's thinking-mode examples pass `tools` but omit `tool_choice`.
+        LangChain's structured-output tool strategy forces `tool_choice`, which
+        the DeepSeek API currently rejects for this path.
+        """
+        return super().bind_tools(
+            tools,
+            tool_choice=None,
+            strict=strict,
+            parallel_tool_calls=parallel_tool_calls,
+            **kwargs,
+        )
 
     def _get_request_payload(
         self,

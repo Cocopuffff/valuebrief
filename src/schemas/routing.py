@@ -11,6 +11,7 @@ class AgentNode(str, Enum):
     SUPERVISOR = "supervisor"
     BEAR = "bear_analyst"
     BULL = "bull_analyst"
+    RESEARCH_ANALYST = "research_analyst"
     JUDGE = "judge_analyst"
     REPORT_GENERATOR = "report_generator"
     CURATOR = "curator_agent"

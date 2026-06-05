@@ -1,5 +1,6 @@
 """Tests for the hybrid RAG retrieval loop: search filters, multi-probe ranking,
 outcome parsing, topic generation, and prompt formatting."""
+# pyright: reportArgumentType=false, reportCallIssue=false
 
 import asyncio
 
@@ -401,6 +402,12 @@ class TestStateTypes:
             "rag_context",
             "retrieved_memory_ids",
             "research_topics",
+            "research_goal",
+            "source_inventory",
+            "research_tasks",
+            "current_task_id",
+            "research_findings",
+            "research_synthesis",
             "thesis_pillars",
             "pillar_outcomes",
         ):

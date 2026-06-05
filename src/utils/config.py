@@ -27,6 +27,10 @@ class AgentConfig(BaseModel):
     temperature: float = 0.2
     max_iterations: int = 2
     thinking: bool = False  # Enable DeepSeek thinking mode (deepseek-v4-pro etc.)
+    timeout_seconds: int = 600
+    max_tool_calls: int = 24
+    max_search_calls: int = 8
+    max_scrape_calls: int = 12
 
 class CuratorConfig(AgentConfig):
     """Curator-specific config, extending AgentConfig with maintenance thresholds."""
@@ -64,6 +68,17 @@ class ModelConfig(BaseModel):
         max_iterations=int(os.environ["BEAR_MAX_ITERATIONS"]),
         thinking=os.environ.get("BEAR_THINKING", "false").lower() == "true"
     ))
+    research: AgentConfig = Field(default_factory=lambda: AgentConfig(
+        provider=Provider(os.environ.get("RESEARCH_PROVIDER", os.environ["BULL_PROVIDER"])),
+        model=os.environ.get("RESEARCH_MODEL", os.environ["BULL_MODEL"]),
+        temperature=float(os.environ.get("RESEARCH_TEMPERATURE", os.environ["BULL_TEMPERATURE"])),
+        max_iterations=int(os.environ.get("RESEARCH_RECURSION_LIMIT", "80")),
+        thinking=os.environ.get("RESEARCH_THINKING", os.environ.get("BULL_THINKING", "false")).lower() == "true",
+        timeout_seconds=int(os.environ.get("RESEARCH_TIMEOUT_SECONDS", "600")),
+        max_tool_calls=int(os.environ.get("RESEARCH_MAX_TOOL_CALLS", "24")),
+        max_search_calls=int(os.environ.get("RESEARCH_MAX_SEARCH_CALLS", "8")),
+        max_scrape_calls=int(os.environ.get("RESEARCH_MAX_SCRAPE_CALLS", "12")),
+    ))
     supervisor: AgentConfig = Field(default_factory=lambda: AgentConfig(
         provider=Provider(os.environ["SUPERVISOR_PROVIDER"]),
         model=os.environ["SUPERVISOR_MODEL"],
@@ -86,7 +101,43 @@ class ModelConfig(BaseModel):
         db_limit_mb=int(os.environ.get("CURATOR_DB_LIMIT_MB", "500")),
     ))
 
-def get_llm(config: AgentConfig):
+
+def is_deepseek_reasoner_model(model: str) -> bool:
+    return model.lower().startswith("deepseek-reasoner")
+
+
+def _tool_compatible_config(config: AgentConfig, role: str) -> AgentConfig:
+    """Return a model config that can be used with tool-calling workflows."""
+    if (
+        config.provider == Provider.DEEPSEEK
+        and is_deepseek_reasoner_model(config.model)
+    ):
+        fallback_model = os.environ.get(
+            f"{role}_TOOL_FALLBACK_MODEL",
+            os.environ.get("DEEPSEEK_TOOL_FALLBACK_MODEL", "deepseek-chat"),
+        )
+        logger.warning(
+            "%s_MODEL=%s does not support DeepSeek tool calling; using %s "
+            "for this tool-using workflow. Use deepseek-v4-pro with "
+            "%s_THINKING=true for thinking-mode tool calls.",
+            role,
+            config.model,
+            fallback_model,
+            role,
+        )
+        return config.model_copy(update={"model": fallback_model, "thinking": False})
+    return config
+
+
+def get_llm(
+    config: AgentConfig,
+    *,
+    require_tool_calling: bool = False,
+    role: str = "AGENT",
+):
+    if require_tool_calling:
+        config = _tool_compatible_config(config, role)
+
     if config.provider == Provider.OPENROUTER:
         from langchain_openrouter import ChatOpenRouter
         return ChatOpenRouter(model=config.model, temperature=config.temperature)
@@ -123,9 +174,26 @@ class Models:
         self.config = ModelConfig()
         self.judge_model = get_llm(self.config.judge)
         self.valuation_model = get_llm(self.config.valuation)
-        self.bull_model = get_llm(self.config.bull)
-        self.bear_model = get_llm(self.config.bear)
-        self.supervisor_model = get_llm(self.config.supervisor)
+        self.bull_model = get_llm(
+            self.config.bull,
+            require_tool_calling=True,
+            role="BULL",
+        )
+        self.bear_model = get_llm(
+            self.config.bear,
+            require_tool_calling=True,
+            role="BEAR",
+        )
+        self.research_model = get_llm(
+            self.config.research,
+            require_tool_calling=True,
+            role="RESEARCH",
+        )
+        self.supervisor_model = get_llm(
+            self.config.supervisor,
+            require_tool_calling=True,
+            role="SUPERVISOR",
+        )
         self.report_generator_model = get_llm(self.config.report_generator)
         self.curator_model = get_llm(self.config.curator)
 
@@ -134,6 +202,7 @@ secrets = Secrets()
 models = Models()
 bull_model = models.bull_model
 bear_model = models.bear_model
+research_model = models.research_model
 supervisor_model = models.supervisor_model
 report_generator_model = models.report_generator_model
 judge_model = models.judge_model

@@ -16,10 +16,12 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from psycopg_pool import AsyncConnectionPool
-from utils.config import secrets
-from utils.db import get_valuation
+from utils.config import config as app_config, secrets
+from utils.db_outbox import drain_db_outbox
+from utils.db import close_pool, get_valuation
 from schemas.base import validate_tickers
 from utils.checkpoint_helpers import _latest_checkpoint_thread_id, _checkpoint_model_updates
+from provider import FinancialDataProvider
 
 # Initialize logger
 setup_logging()
@@ -71,10 +73,6 @@ async def main():
             logger.error(f"{args.portfolio} not found. Please provide tickers via --tickers or create portfolio.json.")
             return
 
-    if not isinstance(raw_tickers, list):
-        logger.error("Portfolio 'tickers' must be a list.")
-        return
-
     if not raw_tickers:
         logger.warning("No tickers to track.")
         return
@@ -90,14 +88,20 @@ async def main():
         "autocommit": True,
         "prepare_threshold": None,
     }
+    await drain_db_outbox()
+
     async with AsyncConnectionPool(
         conninfo=DB_URI,
+        min_size=0,
         max_size=20,
+        max_idle=300,
         kwargs=connection_kwargs,
+        check=AsyncConnectionPool.check_connection,
     ) as pool:
         pool: AsyncConnectionPool[Any]
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
+        await FinancialDataProvider.load_sec_ticker_cache_async()
         workflow = build_research_workflow(checkpointer=checkpointer)
 
         for ticker in tickers:
@@ -112,7 +116,10 @@ async def main():
                         )
                         continue
 
-                    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+                    config: RunnableConfig = {
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": app_config.research.max_iterations,
+                    }
                     saved = await workflow.aget_state(config)
                     if not saved or not saved.values:
                         logger.error(
@@ -148,7 +155,8 @@ async def main():
 
                     run_dt = datetime.now().isoformat()
                     config: RunnableConfig = {
-                        "configurable": {"thread_id": f"{ticker}-{run_dt}"}
+                        "configurable": {"thread_id": f"{ticker}-{run_dt}"},
+                        "recursion_limit": app_config.research.max_iterations,
                     }
                     state: WorkflowState = {
                         "date": date.today().isoformat(),
@@ -170,6 +178,12 @@ async def main():
                         "rag_context": "",
                         "retrieved_memory_ids": [],
                         "research_topics": [],
+                        "research_goal": "",
+                        "source_inventory": [],
+                        "research_tasks": [],
+                        "current_task_id": "",
+                        "research_findings": [],
+                        "research_synthesis": "",
                         "retrieved_memory_outcomes": {},
                         "thesis_pillars": [],
                         "pillar_outcomes": [],
@@ -178,6 +192,8 @@ async def main():
             except Exception as e:
                 logger.error(f"Error running analysis for {ticker}: {e}")
                 logger.debug(traceback.format_exc())
+
+    await close_pool()
 
 
 if __name__ == "__main__":

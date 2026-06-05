@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 from datetime import datetime
+from os import PathLike
 
 
 def _safe_iso(dt_str: str) -> str:
@@ -72,12 +73,12 @@ class RunReportWriter:
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
-    def _write_file(self, path: str, content: str) -> None:
+    def _write_file(self, path: str | PathLike[str], content: str) -> None:
         """Overwrite the file with content (used for header / full reset)."""
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-    def _append_file(self, path: str, content: str) -> None:
+    def _append_file(self, path: str | PathLike[str], content: str) -> None:
         """Append content to the file."""
         with open(path, "a", encoding="utf-8") as f:
             f.write(content)

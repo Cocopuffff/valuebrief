@@ -1,13 +1,15 @@
 from langgraph.types import Command
-from typing import Literal
+from typing import Literal, cast
+from datetime import date
 from agents.states import WorkflowState
-from schemas import AgentNode
+from schemas import AgentNode, ResearchTask, SourceInventoryRecord
 from provider import DateTimeProvider, FinancialDataProvider
 from utils.logger import get_logger, log_node_execution
 from utils.report_writer import RunReportWriter
 from utils import vector_memory
 from utils.research_persistence import memory_ids_from_artifact, persist_research_artifact
 from utils.config import supervisor_model
+from utils.vault import VAULT_ROOT, _parse_frontmatter
 
 logger = get_logger(__name__)
 
@@ -41,8 +43,181 @@ def _build_fundamentals_md(asset) -> str:
     return "\n".join(line for line in lines if line is not None)
 
 
+def _default_research_goal(state: WorkflowState) -> str:
+    company = state.get("company") or state["ticker"]
+    ticker = state["ticker"]
+    return (
+        f"Act as an expert stock research analyst to research and create an "
+        f"investment thesis and DCF valuation inputs for {company} ({ticker}) "
+        "from a value investor point of view. Use the latest information "
+        "available. The research should not have buy or sell bias and should "
+        "include hallmarks of value investing such as margin of safety. Do not "
+        "make bad copy. Ensure all information is properly cited and annotated. "
+        "Be objective."
+    )
+
+
+def _source_inventory_from_vault(ticker: str) -> list[dict]:
+    """Return known filing/transcript inventory from local vault metadata."""
+    ticker_dir = VAULT_ROOT / ticker.upper()
+    if not ticker_dir.exists():
+        return []
+
+    inventory_source_types = {
+        "source_inventory",
+        "sec_filing",
+        "earnings_report",
+        "earnings_transcript",
+    }
+    records: list[dict] = []
+    for path in sorted(ticker_dir.glob("*.md")):
+        try:
+            fm, _ = _parse_frontmatter(path.read_text(encoding="utf-8"))
+        except Exception:
+            fm = {}
+
+        for raw_record in fm.get("source_inventory_records") or []:
+            if not isinstance(raw_record, dict):
+                continue
+            record_dict = {**raw_record}
+            record_dict.setdefault("ticker", ticker)
+            record_dict.setdefault("local_path", str(path))
+            try:
+                records.append(
+                    SourceInventoryRecord(**record_dict).model_dump(mode="json")
+                )
+            except Exception as e:
+                logger.debug("[Supervisor] Skipping malformed source inventory record in %s: %s", path, e)
+
+        source_type = str(fm.get("source_type") or "")
+        url = str(fm.get("url") or "")
+        if source_type not in inventory_source_types and "sec.gov" not in url:
+            continue
+        record = SourceInventoryRecord(
+            ticker=ticker,
+            source_type=source_type or "unknown",
+            title=str(fm.get("title") or path.name),
+            form_type=str(fm.get("form_type") or ""),
+            period=str(fm.get("period") or fm.get("report_date") or ""),
+            filed_at=str(fm.get("filed_at") or fm.get("filing_date") or ""),
+            url=url,
+            accession_number=str(fm.get("accession_number") or ""),
+            local_path=str(path),
+            freshness=str(fm.get("freshness") or "unknown"),
+        )
+        records.append(record.model_dump(mode="json"))
+    return records
+
+
+def _parse_iso_date(value: object) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _is_filing_inventory_record(record: dict) -> bool:
+    source_type = str(record.get("source_type") or "")
+    url = str(record.get("url") or "")
+    return (
+        source_type in ("source_inventory", "sec_filing")
+        or bool(record.get("form_type"))
+        or bool(record.get("accession_number"))
+        or "sec.gov" in url
+    )
+
+
+def _has_current_source_inventory(
+    records: list[dict],
+    as_of_date: str,
+    *,
+    max_age_days: int = 80,
+) -> bool:
+    as_of = _parse_iso_date(as_of_date)
+    if as_of is None:
+        return False
+
+    latest_filed_at: date | None = None
+    for record in records:
+        if not _is_filing_inventory_record(record):
+            continue
+        filed_at = _parse_iso_date(record.get("filed_at"))
+        if filed_at is None:
+            continue
+        if latest_filed_at is None or filed_at > latest_filed_at:
+            latest_filed_at = filed_at
+
+    if latest_filed_at is None:
+        return False
+
+    age_days = (as_of - latest_filed_at).days
+    return 0 <= age_days <= max_age_days
+
+
+def _build_research_tasks(state: WorkflowState, source_inventory: list[dict]) -> list[dict]:
+    """Create one bounded research task; Deep Agents manages the internal todo list."""
+    company = state.get("company") or state["ticker"]
+    ticker = state["ticker"]
+    task = ResearchTask(
+        task_id="deep_agent_research",
+        kind="research_synthesis",
+        title="Run bounded Deep Agent research",
+        objective=(
+            f"Research {company} ({ticker}) once using Deep Agents' internal todo "
+            "list and return source inventory, business model, financial baseline, "
+            "risks, DCF input evidence, and candidate investment pillars."
+        ),
+        acceptance_criteria=[
+            "Use Deep Agents' write_todos planning internally.",
+            "Return multiple cited ResearchFinding records in one ResearchFindingBundle.",
+            "Include a Candidate Investment Pillars section in synthesis.",
+        ],
+        source_requirements=[
+            "SEC filings",
+            "company investor relations",
+            "earnings transcript",
+            "current reputable news or industry sources",
+        ],
+    )
+    return [task.model_dump(mode="json")]
+
+
+def _task_by_id(tasks: list[dict], task_id: str) -> dict | None:
+    for task in tasks:
+        if task.get("task_id") == task_id:
+            return task
+    return None
+
+
+def _dependencies_complete(task: dict, tasks: list[dict]) -> bool:
+    for dep_id in task.get("depends_on", []):
+        dep = _task_by_id(tasks, dep_id)
+        if dep and dep.get("status") not in ("completed", "skipped", "blocked"):
+            return False
+    return True
+
+
+def _next_pending_task(tasks: list[dict]) -> dict | None:
+    for task in tasks:
+        if task.get("status") == "pending" and _dependencies_complete(task, tasks):
+            return task
+    return None
+
+
+def _set_task_status(tasks: list[dict], task_id: str, status: str) -> list[dict]:
+    updated = []
+    for task in tasks:
+        item = dict(task)
+        if item.get("task_id") == task_id:
+            item["status"] = status
+        updated.append(item)
+    return updated
+
+
 @log_node_execution
-async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "bull_research", "bear_research", "__end__"]]:
+async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, AgentNode.RESEARCH_ANALYST, "__end__"]]:
     """
     Supervisor coordinates the workflow and tracks progress.
     Fetches price data on first run, then logs analyst status.
@@ -66,7 +241,7 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
                 if run_dt:
                     try:
                         writer = RunReportWriter(
-                            ticker=state["ticker"], 
+                            ticker=state["ticker"],
                             run_datetime=run_dt,
                             company=company
                         )
@@ -120,21 +295,43 @@ async def supervisor(state: WorkflowState) -> Command[Literal[AgentNode.JUDGE, "
         except Exception as e:
             logger.warning("[Supervisor] ⚠️ Pillar retrieval failed, continuing: %s", e)
 
-    bull_done = state.get('bull_thesis')
-    bear_done = state.get('bear_thesis')
+    if not state.get("research_goal") and not updates.get("research_goal"):
+        updates["research_goal"] = _default_research_goal(
+            cast(WorkflowState, {**state, **updates})
+        )
 
-    logger.info(f"STATUS - Bull: {'COMPLETE' if bull_done else 'INCOMPLETE'}, Bear: {'COMPLETE' if bear_done else 'INCOMPLETE'}")
+    if not state.get("source_inventory") and not updates.get("source_inventory"):
+        updates["source_inventory"] = _source_inventory_from_vault(state["ticker"])
 
-    goto = []
-    if not bull_done:
-        goto.append("bull_research")
-    if not bear_done:
-        goto.append("bear_research")
-    
-    if goto:
-        logger.info(f"Routing to: {goto}") 
-    else:
-        goto = AgentNode.JUDGE
-        logger.info("Theses complete. Routing to Judge.")
+    merged_state = cast(WorkflowState, {**state, **updates})
+    research_complete = bool(
+        merged_state.get("research_findings") or merged_state.get("research_synthesis")
+    )
+    if not research_complete and not merged_state.get("research_tasks"):
+        updates["research_tasks"] = _build_research_tasks(
+            merged_state,
+            merged_state.get("source_inventory", []),
+        )
+        merged_state = cast(
+            WorkflowState,
+            {**merged_state, "research_tasks": updates["research_tasks"]},
+        )
+
+    if not research_complete:
+        tasks = list(merged_state.get("research_tasks", []))
+        next_task = _next_pending_task(tasks)
+        if next_task:
+            tasks = _set_task_status(tasks, str(next_task["task_id"]), "in_progress")
+            updates["research_tasks"] = tasks
+            updates["current_task_id"] = str(next_task["task_id"])
+            logger.info(
+                "[Supervisor] Routing to Deep Agent research task %s: %s",
+                next_task.get("task_id"),
+                next_task.get("title"),
+            )
+            return Command(update=updates, goto=AgentNode.RESEARCH_ANALYST)
+
+    logger.info("[Supervisor] Research tasks complete. Routing to Judge.")
+    goto = AgentNode.JUDGE
 
     return Command(update=updates, goto=goto)

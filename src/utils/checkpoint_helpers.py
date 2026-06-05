@@ -1,5 +1,6 @@
 from typing import Any
 from pydantic import BaseModel
+from psycopg_pool import AsyncConnectionPool
 from schemas import Asset, ValuationModel
 
 def _model_payload(value: Any) -> dict[str, Any]:

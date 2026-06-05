@@ -5,9 +5,9 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 from typing import Literal
-from agents.states import WorkflowState, ResearchState
+from agents.states import WorkflowState, ResearchState, ResearchTaskState
 from agents.supervisor import supervisor
-from agents.analysts import bull_analyst, bear_analyst, research_tool_node
+from agents.analysts import bull_analyst, bear_analyst, research_tool_node, run_research_task
 from agents.judge import judge_analyst
 from agents.report_generator import report_generator
 from agents.curator import curator_agent
@@ -184,18 +184,128 @@ async def run_bear_research(state: WorkflowState) -> Command[Literal[AgentNode.S
 
     return Command(update=update, goto=AgentNode.SUPERVISOR)
 
+
+def _task_by_id(tasks: list[dict], task_id: str) -> dict:
+    for task in tasks:
+        if task.get("task_id") == task_id:
+            return task
+    return {}
+
+
+def _set_task_status(tasks: list[dict], task_id: str, status: str) -> list[dict]:
+    updated: list[dict] = []
+    for task in tasks:
+        item = dict(task)
+        if item.get("task_id") == task_id:
+            item["status"] = status
+        updated.append(item)
+    return updated
+
+
+def _source_inventory_records_from_finding(state: WorkflowState, finding: dict) -> list[dict]:
+    records: list[dict] = []
+    for raw_record in finding.get("source_inventory", []):
+        record = dict(raw_record)
+        record.setdefault("ticker", state["ticker"])
+        record.setdefault("local_path", finding.get("artifact_path", ""))
+        records.append(record)
+    return records
+
+
+async def run_neutral_research(state: WorkflowState) -> Command[Literal[AgentNode.SUPERVISOR]]:
+    task_id = state.get("current_task_id", "")
+    tasks = list(state.get("research_tasks", []))
+    task = _task_by_id(tasks, task_id)
+    if not task:
+        logger.warning("[Research Analyst] No current task found; returning to supervisor")
+        return Command(update={"current_task_id": ""}, goto=AgentNode.SUPERVISOR)
+
+    research_input: ResearchTaskState = {
+        "date": state["date"],
+        "run_datetime": state.get("run_datetime", ""),
+        "company": state["company"],
+        "ticker": state["ticker"],
+        "price_data": state["price_data"],
+        "existing_valuation": state.get("valuation"),
+        "research_goal": state.get("research_goal", ""),
+        "task": task,
+        "research_tasks": tasks,
+        "source_inventory": state.get("source_inventory", []),
+        "rag_context": state.get("rag_context", ""),
+        "prior_findings": state.get("research_findings", []),
+        "sources": [],
+        "finding": {},
+        "synthesis": "",
+        "vault_artifacts": [],
+        "active_memory_ids": [],
+    }
+    result = await run_research_task(research_input)
+    findings = list(result.get("findings") or [])
+    finding = result.get("finding", {})
+    if not findings and finding:
+        findings = [finding]
+    status = "completed"
+    if findings and all(
+        item.get("needs_follow_up") and float(item.get("confidence") or 0) < 0.4
+        for item in findings
+    ):
+        status = "blocked"
+
+    update = {
+        "research_tasks": _set_task_status(tasks, task_id, status),
+        "current_task_id": "",
+        "research_findings": findings,
+    }
+    if result.get("synthesis"):
+        update["research_synthesis"] = result["synthesis"]
+    if result.get("sources"):
+        update["sources"] = result["sources"]
+    if result.get("vault_artifacts"):
+        update["vault_artifacts"] = result["vault_artifacts"]
+    if result.get("active_memory_ids"):
+        update["active_memory_ids"] = result["active_memory_ids"]
+    inventory_records: list[dict] = []
+    for item in findings:
+        inventory_records.extend(_source_inventory_records_from_finding(state, item))
+    if inventory_records:
+        update["source_inventory"] = inventory_records
+
+    try:
+        run_dt = state.get("run_datetime", "")
+        if run_dt and findings:
+            writer = RunReportWriter(
+                ticker=state["ticker"],
+                run_datetime=run_dt,
+                company=state.get("company", ""),
+            )
+            summaries = "\n\n".join(
+                f"### {item.get('title') or item.get('task_id')}\n\n{item.get('summary', '')}"
+                for item in findings
+            )
+            writer._append_file(
+                str(writer.debug_path),
+                (
+                    f"\n## Research Task {task_id}: {task.get('title', '')}\n\n"
+                    f"{summaries}\n\n"
+                    "---\n"
+                ),
+            )
+    except Exception as e:
+        logger.warning("[Research Analyst] Failed to append task finding to run artifact: %s", e)
+
+    return Command(update=update, goto=AgentNode.SUPERVISOR)
+
 def build_research_workflow(checkpointer: AsyncPostgresSaver):
     """Main research workflow.
 
-    Flow: START → Supervisor → Bull/Bear Research → Supervisor → Judge
-          (synthesise + valuate + reconcile) → Report Generator → END
+    Flow: START → Supervisor → Research Analyst → Judge (synthesise + valuate + reconcile)
+          → Report Generator → Curator → END
     """
     store = InMemoryStore()
     return (
         StateGraph(WorkflowState)
         .add_node(AgentNode.SUPERVISOR, supervisor)
-        .add_node("bull_research", run_bull_research)
-        .add_node("bear_research", run_bear_research)
+        .add_node(AgentNode.RESEARCH_ANALYST, run_neutral_research)
         .add_node(AgentNode.JUDGE, judge_analyst)
         .add_node(AgentNode.REPORT_GENERATOR, report_generator)
         .add_node(AgentNode.CURATOR, curator_agent)
